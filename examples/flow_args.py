@@ -96,7 +96,7 @@ def get_args() -> argparse.Namespace:
                         help="Weight decay (L2 regularization) factor.")
 
     # scheduler (Cosine Annealing LR)
-    parser.add_argument("--max_epochs", type=int, default=350,
+    parser.add_argument("--max_epochs", type=int, default=1500,
                         help="Total number of training epochs.")
     parser.add_argument("--eta_min", type=float, default=1e-6,
                         help="Minimum learning rate.")
@@ -104,7 +104,7 @@ def get_args() -> argparse.Namespace:
     # curriculum
     parser.add_argument("--max_rollout_steps", type=int, default=7,
                         help="Maximum autoregressive rollout steps allowed.")
-    parser.add_argument("--rollout_patience", type=int, default=40,
+    parser.add_argument("--rollout_patience", type=int, default=200,
                         help="Epochs of stable loss required to increase rollout difficulty.")
     parser.add_argument("--noise_std_init", type=float, default=0.01,
                         help="Initial Std dev of Gaussian noise injected into input state.")

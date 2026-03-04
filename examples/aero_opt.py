@@ -4,7 +4,7 @@
 import os
 import sys
 import numpy as np
-from scipy.optimize import differential_evolution
+from scipy.optimize import differential_evolution, NonlinearConstraint
 from scipy.optimize import OptimizeResult
 
 
@@ -25,9 +25,9 @@ from wsnet.models.multi_fidelity.mmfs import MMFS
 from wsnet.models.multi_fidelity.cca_mfs import CCAMFS
 
 # Sequential Sampling Methods
-from wsnet.sampling.infill import Infill
-from wsnet.sampling.mico_infill import MICOInfill
-from wsnet.sampling.mo_infill import MOInfill
+from wsnet.sampling.so_infill import SingleObjectiveInfill
+from wsnet.sampling.mf_infill import MultiFidelityInfill
+from wsnet.sampling.mo_infill import MultiObjectiveInfill
 
 # Optimization Methods
 from wsnet.models.optimization.dragonfly import dragonfly_optimize
@@ -311,7 +311,7 @@ if __name__ == "__main__":
     # infill loop
     for i in range(num_infill):
         # instantiate infill strategy (ei: expected improvement)
-        strategy = Infill(
+        strategy = SingleObjectiveInfill(
             model=model_krg, bounds=bounds, y_train=y_current, criterion="ei", target_index=target_index
         )
 
@@ -352,7 +352,7 @@ if __name__ == "__main__":
     model_krg_mico.fit(x_mico, y_mico)
 
     for i in range(num_infill):
-        mico_strategy = MICOInfill(
+        mico_strategy = MultiFidelityInfill(
             model=model_krg_mico,
             x_hf=x_mico,
             y_hf=y_mico,
@@ -383,11 +383,10 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     logger.info(f"{hue.b}>>> Model H: KRG with MOInfill (Constrained IS-EHVI){hue.q}")
 
-    obj_indices        = [0, 1]   # weight, displacement → minimize
-    constraint_indices = [2, 3]   # stress_skin, stress_stiff → constrain
+    obj_indices        = [2, 3]   # stress_skin, stress_stiff → minimize
+    constraint_indices = [0]      # weight → constrain
     constraint_ubs = np.array([
-        np.percentile(y_train[:, 2], 90),   # stress_skin upper bound
-        np.percentile(y_train[:, 3], 90),   # stress_stiff upper bound
+        np.percentile(y_train[:, 0], 50),   # weight upper bound (mock-scale adaptation of Isight's 0.31)
     ])
 
     x_mo = np.copy(x_train)
@@ -396,7 +395,7 @@ if __name__ == "__main__":
     model_krg_mo.fit(x_mo, y_mo)
 
     for i in range(num_infill):
-        mo_strategy = MOInfill(
+        mo_strategy = MultiObjectiveInfill(
             model=model_krg_mo, bounds=bounds, y_train=y_mo,
             obj_indices=obj_indices,
             constraint_indices=constraint_indices,
@@ -411,71 +410,107 @@ if __name__ == "__main__":
         x_mo = np.vstack([x_mo, x_new])
         y_mo = np.vstack([y_mo, y_new])
         model_krg_mo.fit(x_mo, y_mo)
-        logger.info(f"  iteration {i+1}/{num_infill}: weight={y_new[0,0]:.4f}, disp={y_new[0,1]:.4f}")
+        logger.info(f"  iteration {i+1}/{num_infill}: stress_skin={y_new[0,2]:.4f}, stress_stiff={y_new[0,3]:.4f}")
 
     # report Pareto front (objectives only)
     y_mo_obj = y_mo[:, obj_indices]
     pf_mask = mo_strategy._compute_pareto_mask(y_mo_obj)
     y_pf = y_mo_obj[pf_mask]
-    logger.info(f"Pareto front ({pf_mask.sum()} points): weight, displacement")
+    logger.info(f"Pareto front ({pf_mask.sum()} points): stress_skin, stress_stiff")
     for pt in y_pf:
-        logger.info(f"  weight={pt[0]:.4f}, displacement={pt[1]:.4f}")
+        logger.info(f"  stress_skin={pt[0]:.4f}, stress_stiff={pt[1]:.4f}")
 
     # surrogate accuracy (all outputs)
     y_pred_krg_mo, _ = model_krg_mo.predict(x_test)
     evaluate_metrics(y_test, y_pred_krg_mo, "KRG + MOInfill")
 
     # ------------------------------------------------------------------
-    # 11. Global Optimization on Surrogate Surface
+    # 11. Model I & Model J: Constrained Optimization on Surrogate Surface
     # ------------------------------------------------------------------
-    logger.info(f"{hue.b}>>> Performing Global Optimization{hue.q}")
 
-    # define objective function based on the best trained surrogate (e.g., KRG)
-    # we want to find x that minimizes y[target_index] (weight)
-    def surrogate_objective(x_vec: np.ndarray) -> float:
-        x_in = x_vec.reshape(1, -1)
-        pred, _ = model_krg.predict(x_in)
-        # return scalar value for the specific target output
-        return float(pred[0, target_index])
+    opt_single_idx = 2          # stress_skin (Von Mises) — Isight single-obj target
+    mo_obj_indices  = [2, 3]   # stress_skin, stress_stiff — multi-obj targets
+    scipy_bounds    = [(bounds[i, 0], bounds[i, 1]) for i in range(num_features)]
+    weight_ub       = float(np.percentile(y_train[:, 0], 50))  # Isight: weight <= 0.31
 
-    # bounds tuple for scipy
-    scipy_bounds = [(bounds[i, 0], bounds[i, 1]) for i in range(num_features)]
+    def _single_obj(x_vec: np.ndarray) -> float:
+        """Predict stress_skin (mises) from KRG surrogate.
 
-    # choose optimizer: "de" (scipy differential_evolution) or "cfssda" (dragonfly)
-    optimizer_name = "cfssda"
+        Args:
+            x_vec (np.ndarray): design point. shape: (num_features,).
 
-    if optimizer_name.lower() == "de":
-        # using differential evolution (robust global optimizer)
-        result: OptimizeResult = differential_evolution(
-            func=surrogate_objective, bounds=scipy_bounds, strategy="best1bin",
-            maxiter=50, popsize=10, tol=1e-6, seed=42
-        )
-    elif optimizer_name.lower() == "cfssda":
-        # using CFSSDA optimizer (robust population-based global optimizer)
-        result = dragonfly_optimize(
-            func=surrogate_objective,
-            bounds=scipy_bounds,
-            maxiter=120,
-            popsize=20,
-            tol=1e-6,
-            seed=42,
-            multi_objective=False,
-            scalarization="weighted_sum"
-        )
-    else:
-        raise ValueError(f"unknown optimizer_name: {optimizer_name}")
+        Returns:
+            float: predicted Von Mises stress at x_vec.
+        """
+        pred, _ = model_krg.predict(x_vec.reshape(1, -1))
+        return float(pred[0, opt_single_idx])
 
-    best_x = result.x
-    pred_y_min = result.fun
+    def _multi_obj(x_vec: np.ndarray) -> np.ndarray:
+        """Predict [stress_skin, stress_stiff] from KRG surrogate.
 
-    # verification: evaluate the actual abaqus model at the found optimal point
-    logger.info("verifying optimal point with high-fidelity simulation...")
-    true_y_vector = AbaqusModel(fidelity="high").run(best_x)
-    true_y_min = true_y_vector[target_index]
+        Args:
+            x_vec (np.ndarray): design point. shape: (num_features,).
 
-    logger.info("optimization results:")
-    logger.info(f"best parameters (x) : {best_x}")
-    logger.info(f"predicted min (obj) : {hue.c}{pred_y_min:.6f}{hue.q}")
-    logger.info(f"verified min (obj)  : {hue.g}{true_y_min:.6f}{hue.q}")
-    logger.info(f"full output vector  : {true_y_vector}")
+        Returns:
+            np.ndarray: predicted [stress_skin, stress_stiff]. shape: (2,).
+        """
+        pred, _ = model_krg.predict(x_vec.reshape(1, -1))
+        return pred[0, mo_obj_indices]
+
+    weight_con = NonlinearConstraint(
+        fun=lambda x: float(model_krg.predict(x.reshape(1, -1))[0][0, 0]),
+        lb=-np.inf, ub=weight_ub,
+    )
+
+    # ---- Model I: DE ----
+    logger.info(f"{hue.b}>>> Model I: DE{hue.q}")
+
+    ri_s: OptimizeResult = differential_evolution(
+        func=_single_obj, bounds=scipy_bounds, constraints=weight_con,
+        strategy="best1bin", maxiter=50, popsize=10, tol=1e-6, seed=42,
+    )
+    true_i_s = AbaqusModel(fidelity="high").run(ri_s.x)
+    logger.info(f"  [Single-obj] best x : {ri_s.x}")
+    logger.info(f"  predicted mises     : {hue.c}{ri_s.fun:.6f}{hue.q}  |  verified: {hue.g}{true_i_s[opt_single_idx]:.6f}{hue.q}")
+    logger.info(f"  verified weight     : {true_i_s[0]:.6f}  (ub={weight_ub:.4f})")
+
+    def _de_mo_scalarized(x_vec: np.ndarray) -> float:
+        return float(np.sum(_multi_obj(x_vec)))  # equal-weight scalarization
+
+    ri_m: OptimizeResult = differential_evolution(
+        func=_de_mo_scalarized, bounds=scipy_bounds, constraints=weight_con,
+        strategy="best1bin", maxiter=50, popsize=10, tol=1e-6, seed=42,
+    )
+    true_i_m = AbaqusModel(fidelity="high").run(ri_m.x)
+    logger.info(f"  [Multi-obj]  best x : {ri_m.x}")
+    logger.info(f"  predicted [sk, ss]  : {_multi_obj(ri_m.x)}")
+    logger.info(f"  verified  [sk, ss]  : {hue.g}{true_i_m[mo_obj_indices]}{hue.q}")
+    print("")
+
+    # ---- Model J: CFSSDA ----
+    logger.info(f"{hue.b}>>> Model J: CFSSDA{hue.q}")
+
+    rj_s = dragonfly_optimize(
+        func=_single_obj, bounds=scipy_bounds, constraints=weight_con,
+        maxiter=120, popsize=20, tol=1e-6, seed=42, multi_objective=False,
+    )
+    true_j_s = AbaqusModel(fidelity="high").run(rj_s.x)
+    logger.info(f"  [Single-obj] best x : {rj_s.x}")
+    logger.info(f"  predicted mises     : {hue.c}{rj_s.fun:.6f}{hue.q}  |  verified: {hue.g}{true_j_s[opt_single_idx]:.6f}{hue.q}")
+    logger.info(f"  verified weight     : {true_j_s[0]:.6f}  (ub={weight_ub:.4f})")
+
+    rj_m = dragonfly_optimize(
+        func=_multi_obj, bounds=scipy_bounds, constraints=weight_con,
+        maxiter=120, popsize=20, tol=1e-6, seed=42,
+        multi_objective=True, scalarization="weighted_sum", return_pareto=True,
+    )
+    true_j_m = AbaqusModel(fidelity="high").run(rj_m.x)
+    logger.info(f"  [Multi-obj]  best x : {rj_m.x}")
+    logger.info(f"  predicted [sk, ss]  : {_multi_obj(rj_m.x)}")
+    logger.info(f"  verified  [sk, ss]  : {hue.g}{true_j_m[mo_obj_indices]}{hue.q}")
+    if hasattr(rj_m, "pareto_f") and rj_m.pareto_f is not None:
+        logger.info(f"  Pareto front ({len(rj_m.pareto_f)} pts):")
+        for pt in rj_m.pareto_f:
+            logger.info(f"    stress_skin={pt[0]:.4f}, stress_stiff={pt[1]:.4f}")
+
     logger.info(f"{hue.b}process completed successfully.{hue.q}")
