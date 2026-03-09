@@ -20,7 +20,61 @@ from typing import List, Optional
 
 
 # ============================================================
-# Sinusoidal Time Encoder  (identical to geofnot.py)
+# Spatial Encoder (Random Fourier Features)
+# ============================================================
+
+class SpatialEncoder(nn.Module):
+    """Random Fourier Feature encoding for irregular mesh coordinates.
+
+    Encodes spatial coordinates via a fixed random projection:
+        gamma(x) = [sin(2*pi*B*x); cos(2*pi*B*x)]
+    where B ~ N(0, sigma^2) is a non-trainable projection matrix.
+
+    This converts raw (x, y) coordinates into a 2*coord_features-dim
+    representation that captures spatial distances at multiple frequencies,
+    giving Physics-Attention richer geometry context than raw coords.
+
+    The B_matrix is stored as a non-trainable buffer — it is random at init
+    and fixed throughout training. Different random seeds produce different
+    encodings, but the model learns to use whatever encoding it receives.
+
+    Output dim: 2 * coord_features.
+    """
+
+    def __init__(self, spatial_dim: int, coord_features: int = 8, sigma: float = 1.0):
+        """
+        Args:
+            spatial_dim: Spatial dimensionality of the mesh (2 or 3).
+            coord_features: Half-dimension of the output encoding.
+                            Output shape: (..., 2 * coord_features).
+            sigma: Standard deviation of the random projection matrix.
+                   Controls spatial frequency bandwidth of the encoding.
+                   sigma=1.0 gives ~0.5 cycles across a [-1,1]-normalized domain.
+        """
+        super().__init__()
+        self.coord_features = coord_features
+        self.sigma = sigma
+
+        # B_matrix: (spatial_dim, coord_features), fixed non-trainable
+        B = torch.randn(spatial_dim, coord_features) * sigma
+        self.register_buffer('B_matrix', B)  # (spatial_dim, coord_features)
+
+    def forward(self, coords: Tensor) -> Tensor:
+        """Encode coordinates with RFF.
+
+        Args:
+            coords: Node coordinates in [-1, 1]. Shape: (B, N, spatial_dim).
+
+        Returns:
+            RFF encoding. Shape: (B, N, 2 * coord_features).
+        """
+        # proj: (B, N, coord_features)
+        proj = (2.0 * torch.pi) * (coords @ self.B_matrix)
+        return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
+
+
+# ============================================================
+# Sinusoidal Time Encoder
 # ============================================================
 
 class SinusoidalTimeEncoder(nn.Module):
@@ -191,11 +245,19 @@ class Transolver(nn.Module):
     compressed space, then broadcasts back to N nodes. No regular grid needed
     -> no grid interpolation errors, no scatter-mean dissipation.
 
+    Spatio-Temporal Positional Encoding:
+        - Spatial: RFF encoding gamma(x) = [sin(2*pi*B*x); cos(2*pi*B*x)]
+                   with B ~ N(0, sigma^2), non-trainable. Captures relative
+                   spatial distances at multiple frequencies.
+        - Temporal: Sinusoidal PE psi(t) = [sin(omega_i*t); cos(omega_i*t)]
+                    with omega_i = max_steps^(-i/time_features), t in [0,1].
+
     Architecture:
-        Embed:  cat([node_features, physical_coords, time_emb]) -> Linear -> width
+        Embed:  cat([node_features, rff(coords), time_emb]) -> Linear -> width
         Layers: L x TransolverBlock (PhysicsAttention + LayerNorm + FFN)
         Output: Linear(width -> out_channels)
 
+    Embed input dim: in_channels + 2*coord_features + 2*time_features
     Complexity per layer: O(N*M*C + M^2*C), linear in N for M << N.
     Reference: Wu et al., ICML 2024. https://github.com/thuml/Transolver
     """
@@ -212,6 +274,8 @@ class Transolver(nn.Module):
         ffn_dim: Optional[int] = None,
         time_features: int = 4,
         max_steps: int = 1000,
+        coord_features: int = 8,
+        coord_sigma: float = 1.0,
     ):
         """
         Args:
@@ -225,6 +289,10 @@ class Transolver(nn.Module):
             ffn_dim: Inner FFN dimension. Defaults to 4 * width.
             time_features: Sinusoidal PE half-dimension (output: 2*time_features dims).
             max_steps: Reference max time step for sinusoidal frequency scaling.
+            coord_features: RFF spatial encoding half-dim (output: 2*coord_features).
+                            Set 0 to use raw coordinates instead of RFF encoding.
+            coord_sigma: RFF projection scale (std of B_matrix). Controls spatial
+                         frequency bandwidth of the spatial encoding.
 
         Raises:
             AssertionError: If width is not divisible by num_heads.
@@ -235,6 +303,7 @@ class Transolver(nn.Module):
             f'width={width} must be divisible by num_heads={num_heads}'
 
         self.spatial_dim = spatial_dim
+        self.coord_features = coord_features
         if ffn_dim is None:
             ffn_dim = 4 * width
 
@@ -244,9 +313,20 @@ class Transolver(nn.Module):
             max_steps=max_steps,
         )
 
-        # Input embedding: [features + coords + time_emb] -> width
-        # Physical coords are concatenated directly — no deformation net or grid needed
-        embed_in = in_channels + spatial_dim + 2 * time_features
+        # Spatial encoder (RFF) — optional; coord_features=0 falls back to raw coords
+        if coord_features > 0:
+            self.spatial_encoder = SpatialEncoder(
+                spatial_dim=spatial_dim,
+                coord_features=coord_features,
+                sigma=coord_sigma,
+            )
+            coord_dim = 2 * coord_features
+        else:
+            self.spatial_encoder = None
+            coord_dim = spatial_dim
+
+        # Input embedding: [features + coord_enc + time_emb] -> width
+        embed_in = in_channels + coord_dim + 2 * time_features
         self.embed = nn.Linear(embed_in, width)
 
         # Transolver blocks
@@ -275,7 +355,7 @@ class Transolver(nn.Module):
             t_norm: Normalized frame times in [0, 1]. Shape: (B,).
                     If None, defaults to zeros.
             **kwargs: Accepts (and ignores) latent_coords for API compatibility
-                      with GeoFNO/GeoFNOT.
+                      with GeoFNO.
 
         Returns:
             Predicted node features at time t+1. Shape: (B, N, out_channels).
@@ -285,11 +365,17 @@ class Transolver(nn.Module):
         if t_norm is None:
             t_norm = torch.zeros(B, device=physical_coords.device)
 
+        # Spatial encoding: RFF or raw coords
+        if self.spatial_encoder is not None:
+            coord_enc = self.spatial_encoder(physical_coords)  # (B, N, 2*coord_features)
+        else:
+            coord_enc = physical_coords  # (B, N, spatial_dim)
+
         # Temporal encoding: t_norm -> (B, N, 2*time_features)
         time_emb = self.time_encoder.encode_time(t_norm, N)
 
-        # Embedding: cat([features, coords, time_emb]) -> hidden
-        x = self.embed(torch.cat([input_features, physical_coords, time_emb], dim=-1))
+        # Embedding: cat([features, coord_enc, time_emb]) -> hidden
+        x = self.embed(torch.cat([input_features, coord_enc, time_emb], dim=-1))
 
         # Transolver blocks
         for layer in self.layers:

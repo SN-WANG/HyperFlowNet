@@ -46,10 +46,10 @@ def get_args() -> argparse.Namespace:
     # ----------------------------------------------------------------------
     # 3. Model Architecture
     # ----------------------------------------------------------------------
-    parser.add_argument("--model_type", type=str, default="geowno",
-                        choices=["geofno", "geowno", "geofnot", "transolver"],
-                        help="Neural operator architecture: GeoFNO (Fourier), GeoWNO (Haar Wavelet), "
-                             "GeoFNOT (Fourier + KNN-IDW + temporal), or Transolver (Physics-Attention, grid-free).")
+    parser.add_argument("--model_type", type=str, default="transolver",
+                        choices=["geofno", "transolver"],
+                        help="Neural operator architecture: GeoFNO (Fourier spectral) or "
+                             "Transolver (Physics-Attention, grid-free).")
 
     parser.add_argument("--modes", type=int, nargs='+', default=[12, 12],
                         help="Number of Fourier/wavelet modes per dimension "
@@ -67,29 +67,23 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--deform_hidden", type=int, default=32,
                         help="Hidden dimension size for the deformation network.")
 
-    # GeoWNO-specific params
-    parser.add_argument("--knn_k", type=int, default=6,
-                        help="[GeoWNO] Number of nearest neighbors for KNN-IDW point-to-grid aggregation.")
-    parser.add_argument("--rff_features", type=int, default=8,
-                        help="[GeoWNO] Random Fourier Features half-dim for spatial encoding"
-                             "(output: 2*rff_features).")
+    # Temporal encoding params (used by Transolver)
     parser.add_argument("--time_features", type=int, default=4,
-                        help="[GeoWNO] Sinusoidal PE half-dim for temporal encoding"
-                             "(output: 2*time_features).")
+                        help="Sinusoidal PE half-dim for temporal encoding (output: 2*time_features).")
     parser.add_argument("--max_steps", type=int, default=1000,
-                        help="[GeoWNO] Maximum time step for sinusoidal temporal frequency scaling. "
+                        help="Maximum time step for sinusoidal temporal frequency scaling. "
                              "Controls frequency bandwidth of time encoding; set close to data seq_len.")
-    parser.add_argument("--rff_sigma", type=float, default=1.0,
-                        help="[GeoWNO] RFF projection scale. Controls spatial frequency of encoding "
-                             "(1.0 = ~0.5 cycles across domain, survives KNN-IDW averaging).")
-    parser.add_argument("--wavelet_levels", type=int, default=2,
-                        help="[GeoWNO] Number of Haar DWT decomposition levels (J). "
-                             "J=1 = single-level, J=2 = two-level multi-resolution.")
 
     # Transolver-specific params
     parser.add_argument("--num_slices", type=int, default=32,
                         help="[Transolver] Number of physics slice tokens (M). "
                              "Higher M captures more distinct physics modes at higher memory cost.")
+    parser.add_argument("--coord_features", type=int, default=8,
+                        help="[Transolver] RFF spatial encoding half-dim (output: 2*coord_features). "
+                             "Set 0 to use raw coordinates (no RFF).")
+    parser.add_argument("--coord_sigma", type=float, default=1.0,
+                        help="[Transolver] RFF projection scale for spatial encoding. "
+                             "Controls spatial frequency bandwidth of coord encoding.")
 
     # ----------------------------------------------------------------------
     # 4. Training Strategy
@@ -102,7 +96,7 @@ def get_args() -> argparse.Namespace:
                         help="Weight decay (L2 regularization) factor.")
 
     # scheduler (Cosine Annealing LR)
-    parser.add_argument("--max_epochs", type=int, default=1500,
+    parser.add_argument("--max_epochs", type=int, default=300,
                         help="Total number of training epochs.")
     parser.add_argument("--eta_min", type=float, default=1e-6,
                         help="Minimum learning rate.")
@@ -110,7 +104,7 @@ def get_args() -> argparse.Namespace:
     # curriculum
     parser.add_argument("--max_rollout_steps", type=int, default=7,
                         help="Maximum autoregressive rollout steps allowed.")
-    parser.add_argument("--rollout_patience", type=int, default=200,
+    parser.add_argument("--rollout_patience", type=int, default=40,
                         help="Epochs of stable loss required to increase rollout difficulty.")
     parser.add_argument("--noise_std_init", type=float, default=0.01,
                         help="Initial Std dev of Gaussian noise injected into input state.")

@@ -19,8 +19,6 @@ if project_root not in sys.path: sys.path.insert(0, project_root)
 
 
 from wsnet.models.neural.geofno import GeoFNO
-from wsnet.models.neural.geowno import GeoWNO
-from wsnet.models.neural.geofnot import GeoFNOT
 from wsnet.models.neural.transolver import Transolver
 
 from wsnet.data.flow_data import FlowData
@@ -87,29 +85,6 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
             depth=args.depth, width=args.width,
             deformation_kwargs=deform_kw,
         )
-    elif args.model_type == "geowno":
-        return GeoWNO(
-            in_channels=in_ch, out_channels=out_ch,
-            modes=args.modes, latent_grid_size=args.latent_grid_size,
-            depth=args.depth, width=args.width,
-            deformation_kwargs=deform_kw,
-            knn_k=args.knn_k,
-            rff_features=args.rff_features,
-            time_features=args.time_features,
-            max_steps=args.max_steps,
-            rff_sigma=args.rff_sigma,
-            wavelet_levels=args.wavelet_levels,
-        )
-    elif args.model_type == "geofnot":
-        return GeoFNOT(
-            in_channels=in_ch, out_channels=out_ch,
-            modes=args.modes, latent_grid_size=args.latent_grid_size,
-            depth=args.depth, width=args.width,
-            deformation_kwargs=deform_kw,
-            knn_k=args.knn_k,
-            time_features=args.time_features,
-            max_steps=args.max_steps,
-        )
     elif args.model_type == "transolver":
         return Transolver(
             in_channels=in_ch, out_channels=out_ch,
@@ -118,9 +93,11 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
             num_slices=args.num_slices,
             time_features=args.time_features,
             max_steps=args.max_steps,
+            coord_features=args.coord_features,
+            coord_sigma=args.coord_sigma,
         )
     else:
-        raise ValueError(f"Unknown model_type '{args.model_type}'. Choices: geofno, geowno, geofnot, transolver")
+        raise ValueError(f"Unknown model_type '{args.model_type}'. Choices: geofno, transolver")
 
 
 # ======================================================================

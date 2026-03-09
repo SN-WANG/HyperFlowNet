@@ -35,8 +35,8 @@ def _channel_role(ch_idx: int, spatial_dim: int) -> str:
 
 _CMAP: dict = {
     'velocity':    'RdBu_r',   # diverging, zero = white — correct for ±Vx/Vy
-    'pressure':    'plasma',   # perceptually uniform sequential (log scale)
-    'temperature': 'plasma',   # same
+    'pressure':    'viridis',  # perceptually uniform sequential
+    'temperature': 'viridis',  # same
     'error':       'Reds',     # sequential, always non-negative
 }
 
@@ -47,10 +47,10 @@ class FlowVis:
 
     Features:
     - Off-screen GPU rendering via VTK + EGL (NVIDIA headless servers)
-    - log₁₀(P) colormap for high-pressure-ratio (10000:1) flows
     - Percentile-clipped (2 %–98 %) color limits: reveals small variations
       in near-constant fields such as temperature
     - Diverging colormap (RdBu_r) for velocity channels (zero = white)
+    - viridis colormap for pressure and temperature (perceptually uniform)
     - Error column uses Reds (strictly non-negative)
     - No imageio-ffmpeg dependency: encodes via system ffmpeg subprocess
 
@@ -178,18 +178,16 @@ class FlowVis:
         """
         Apply channel-specific visualization transform.
 
-        Pressure: log₁₀(clip(P, 1.0)) — compresses 10000:1 dynamic range.
-        Others:   identity.
+        All channels: identity transform. Percentile clipping in _get_clim
+        handles dynamic range compression without distorting absolute values.
 
         Args:
             data:   Array of any shape for a single channel.
-            ch_idx: Channel index.
+            ch_idx: Channel index (unused; kept for API consistency).
 
         Returns:
-            Transformed array (same shape as input).
+            Input array unchanged.
         """
-        if ch_idx == self.p_idx:
-            return np.log10(np.clip(data, 1.0, None))
         return data
 
     def _get_clim(self, data: np.ndarray) -> Tuple[float, float]:
@@ -224,11 +222,10 @@ class FlowVis:
         """
         name = self.ch_names[ch_idx] if ch_idx < len(self.ch_names) else f'Ch{ch_idx}'
         if col == 2:
-            # Error is always in physical units (Pa for pressure, not log₁₀)
             suffix = ' (Pa)' if ch_idx == self.p_idx else ''
             return f'|\u0394{name}|{suffix}'
         if ch_idx == self.p_idx:
-            return 'P (log\u2081\u2080 Pa)'   # P (log₁₀ Pa)
+            return 'P (Pa)'
         return name
 
     def _setup_camera(self, plotter: pv.Plotter, points: np.ndarray = None) -> None:
@@ -468,9 +465,7 @@ class FlowVis:
         Render Ground Truth / Prediction / Abs Error comparison animation.
 
         Layout: num_channels rows x 3 columns.
-        GT and Pred share the same color limits; Error has its own.
-        Pressure is shown in log10(Pa) in GT/Pred columns and in raw Pa in
-        the Error column (absolute residual preserves physical interpretation).
+        GT and Pred share the same color limits (percentile-clipped); Error has its own.
 
         Args:
             gt:          (seq_len, N, C) ground truth in physical units.
@@ -490,7 +485,7 @@ class FlowVis:
         base_mesh = self._build_mesh(points)
         use_surface = base_mesh.n_cells > 0
 
-        # Log10(P) applied to GT/Pred only; error stays in physical units (Pa).
+        # Preprocess all channels (identity transform — no log).
         gt_vis   = np.stack(
             [self._preprocess(gt_np[:, :, c],   c) for c in range(num_channels)], axis=-1,
         )
@@ -573,383 +568,6 @@ class FlowVis:
         self._animate(plotter, _update, seq_len, out_path, file_format,
                       desc=f'Rendering {case_name}')
         logger.info(f'comparison animation saved to {hue.g}{out_path}{hue.q}')
-
-    def export_html(
-        self,
-        gt: Tensor,
-        pred: Tensor,
-        coords: Tensor,
-        case_name: str,
-        n_frames: int = 100,
-        include_plotlyjs: str = 'cdn',
-    ) -> None:
-        """
-        Export an interactive self-contained HTML visualization.
-
-        Embeds all frame data as gzip+base64 uint8, generates a Plotly
-        Scattergl visualization with channel switching, frame scrubbing,
-        play/pause, and dynamic vs fixed color-scale modes.
-
-        Args:
-            gt:              (seq_len, N, C) ground truth in physical units.
-            pred:            (seq_len, N, C) prediction in physical units.
-            coords:          (N, 2) node coordinates.
-            case_name:       Output filename prefix.
-            n_frames:        Frames to uniformly sample from seq_len (default 100).
-            include_plotlyjs: 'cdn' uses CDN link; True embeds JS inline (~4 MB larger).
-
-        Output:
-            {output_dir}/{case_name}_interactive.html
-        """
-        import gzip as _gzip
-        import base64 as _base64
-        import json as _json
-
-        seq_len, N, C = gt.shape
-        frame_indices = np.linspace(0, seq_len - 1, n_frames, dtype=int)
-
-        gt_np   = gt.detach().cpu().numpy()
-        pred_np = pred.detach().cpu().numpy()
-
-        gt_sel   = gt_np[frame_indices]                                    # (n_frames, N, C)
-        pred_sel = pred_np[frame_indices]
-        err_sel  = np.abs(gt_np[frame_indices] - pred_np[frame_indices])   # physical units
-
-        # Channel-specific preprocessing (log10 for P)
-        gt_vis   = np.stack([self._preprocess(gt_sel[:, :, c],   c) for c in range(C)], axis=-1)
-        pred_vis = np.stack([self._preprocess(pred_sel[:, :, c], c) for c in range(C)], axis=-1)
-        err_vis  = err_sel.copy()   # no log preprocessing on error
-
-        # --- Fixed global color limits (GT/Pred share; Error has its own) ---
-        clims_gp  = []
-        clims_err = []
-        for c in range(C):
-            combined = np.concatenate([gt_vis[:, :, c].ravel(), pred_vis[:, :, c].ravel()])
-            lo = float(np.percentile(combined, 2))
-            hi = float(np.percentile(combined, 98))
-            if abs(hi - lo) < 1e-9:
-                center = (lo + hi) * 0.5
-                lo, hi = center - 1e-6, center + 1e-6
-            if _channel_role(c, self.spatial_dim) == 'velocity' and lo < 0 < hi:
-                vmax = max(abs(lo), abs(hi))
-                lo, hi = -vmax, vmax
-            clims_gp.append([lo, hi])
-            clims_err.append(list(self._get_clim(err_vis[:, :, c])))
-
-        clims_fixed = [clims_gp, clims_gp, clims_err]  # [panel=GT/Pred/Err][channel]
-
-        # --- Dynamic per-frame color limits ---
-        def _frame_clim(arr, c):
-            lo = float(np.percentile(arr[:, c], 2))
-            hi = float(np.percentile(arr[:, c], 98))
-            if abs(hi - lo) < 1e-9:
-                center = (lo + hi) * 0.5
-                lo, hi = center - 1e-6, center + 1e-6
-            return [lo, hi]
-
-        dyn_gt   = [[_frame_clim(gt_vis[f],   c) for c in range(C)] for f in range(n_frames)]
-        dyn_pred = [[_frame_clim(pred_vis[f],  c) for c in range(C)] for f in range(n_frames)]
-        dyn_err  = [[_frame_clim(err_vis[f],   c) for c in range(C)] for f in range(n_frames)]
-
-        # Synchronise GT/Pred dynamic clims per frame
-        for f in range(n_frames):
-            for c in range(C):
-                lo = min(dyn_gt[f][c][0], dyn_pred[f][c][0])
-                hi = max(dyn_gt[f][c][1], dyn_pred[f][c][1])
-                if abs(hi - lo) < 1e-9:
-                    center = (lo + hi) * 0.5
-                    lo, hi = center - 1e-6, center + 1e-6
-                if _channel_role(c, self.spatial_dim) == 'velocity' and lo < 0 < hi:
-                    vmax = max(abs(lo), abs(hi))
-                    lo, hi = -vmax, vmax
-                dyn_gt[f][c]   = [lo, hi]
-                dyn_pred[f][c] = [lo, hi]
-
-        clims_dynamic = [dyn_gt, dyn_pred, dyn_err]
-
-        # --- Quantise to uint8 (using fixed clims as reference) ---
-        def _to_uint8(arr2d, vmin, vmax):
-            rng = max(vmax - vmin, 1e-9)
-            return np.clip((arr2d - vmin) / rng * 255, 0, 255).round().astype(np.uint8)
-
-        panels_u8 = []
-        for pidx, pvis in enumerate([gt_vis, pred_vis, err_vis]):
-            p = np.zeros((n_frames, N, C), dtype=np.uint8)
-            for c in range(C):
-                vmin, vmax = clims_fixed[pidx][c]
-                p[:, :, c] = _to_uint8(pvis[:, :, c], vmin, vmax)
-            panels_u8.append(p)
-
-        # Stack → (3, n_frames, N, C), flatten, gzip, base64
-        raw_bytes  = np.stack(panels_u8, axis=0).tobytes()
-        compressed = _gzip.compress(raw_bytes, compresslevel=6)
-        encoded    = _base64.b64encode(compressed).decode('ascii')
-
-        # --- Coordinates and metadata ---
-        coords_np = coords.detach().cpu().numpy()
-        x_coords  = coords_np[:, 0].tolist()
-        y_coords  = coords_np[:, 1].tolist()
-
-        ch_colormaps = [
-            'RdBu_r' if _channel_role(c, self.spatial_dim) == 'velocity' else 'plasma'
-            for c in range(C)
-        ]
-        ch_names = (self.ch_names[:C] if len(self.ch_names) >= C
-                    else [f'Ch{i}' for i in range(C)])
-
-        # --- Plotly.js source ---
-        if include_plotlyjs is True:
-            try:
-                import plotly as _plotly
-                js_path = (Path(_plotly.__file__).parent / 'package_data' / 'plotly.min.js')
-                plotlyjs_tag = f'<script>{js_path.read_text()}</script>'
-            except Exception:
-                plotlyjs_tag = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>'
-        else:
-            plotlyjs_tag = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>'
-
-        meta = {
-            'n_frames':       n_frames,
-            'n_nodes':        N,
-            'n_channels':     C,
-            'frame_times':    frame_indices.tolist(),
-            'ch_names':       ch_names,
-            'ch_colormaps':   ch_colormaps,
-            'clims_fixed':    clims_fixed,
-            'clims_dynamic':  clims_dynamic,
-            'p_idx':          self.p_idx,
-        }
-
-        # Dynamic section: Python fills in the data values
-        data_js = (
-            f'const ENCODED = "{encoded}";\n'
-            f'const X_COORDS = {_json.dumps(x_coords)};\n'
-            f'const Y_COORDS = {_json.dumps(y_coords)};\n'
-            f'const META = {_json.dumps(meta)};\n'
-            f'const FRAME_MAX = {n_frames - 1};\n'
-        )
-
-        # Static JavaScript (raw string — no brace escaping needed)
-        static_js = r"""let DATA = null;
-let currentChannel = 0;
-let currentFrame   = 0;
-let scaleMode      = 'fixed';
-let playing        = false;
-let animTimer      = null;
-
-async function decodeData(encoded) {
-    const bin   = atob(encoded);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    const ds     = new DecompressionStream('gzip');
-    const writer = ds.writable.getWriter();
-    const reader = ds.readable.getReader();
-    writer.write(bytes);
-    writer.close();
-    const chunks = [];
-    while (true) {
-        const {value, done} = await reader.read();
-        if (done) break;
-        if (value) chunks.push(value);
-    }
-    const total = chunks.reduce((s, c) => s + c.length, 0);
-    const out   = new Uint8Array(total);
-    let off = 0;
-    for (const c of chunks) { out.set(c, off); off += c.length; }
-    return out;
-}
-
-function extractColors(panel, frame, channel) {
-    const {n_frames, n_nodes, n_channels} = META;
-    const base   = (panel * n_frames * n_nodes + frame * n_nodes) * n_channels + channel;
-    const stride = n_channels;
-    let vmin, vmax;
-    if (scaleMode === 'fixed') {
-        [vmin, vmax] = META.clims_fixed[panel][channel];
-    } else {
-        [vmin, vmax] = META.clims_dynamic[panel][frame][channel];
-    }
-    const scale  = (vmax - vmin) / 255;
-    const colors = new Array(n_nodes);
-    for (let i = 0; i < n_nodes; i++) colors[i] = vmin + DATA[base + i * stride] * scale;
-    return {colors, vmin, vmax};
-}
-
-const DIVS       = ['plot-gt', 'plot-pred', 'plot-err'];
-const PANEL_TTLS = ['Ground Truth', 'Prediction', 'Abs Error'];
-const ERROR_CMAP = 'Reds';
-
-function getCmap(panel) {
-    return panel < 2 ? META.ch_colormaps[currentChannel] : ERROR_CMAP;
-}
-
-function cbTitle(panel) {
-    return panel < 2 ? META.ch_names[currentChannel] : '|\u0394Field|';
-}
-
-function initPlots() {
-    const mSize = Math.max(2, Math.min(5, Math.round(2500 / META.n_nodes)));
-    for (let p = 0; p < 3; p++) {
-        const {colors, vmin, vmax} = extractColors(p, 0, currentChannel);
-        const trace = {
-            type: 'scattergl', mode: 'markers',
-            x: X_COORDS, y: Y_COORDS,
-            marker: {
-                color: colors, colorscale: getCmap(p),
-                cmin: vmin, cmax: vmax, size: mSize,
-                colorbar: {
-                    thickness: 12, len: 0.8,
-                    title: {text: cbTitle(p), font: {size: 11, color: '#ccc'}},
-                },
-            },
-            hovertemplate: 'x:%{x:.3f} y:%{y:.3f}<br>val:%{marker.color:.3e}<extra></extra>',
-        };
-        const layout = {
-            title: {text: PANEL_TTLS[p], font: {size: 13, color: '#ccc'}},
-            paper_bgcolor: '#1a1a2e', plot_bgcolor: '#1a1a2e',
-            font: {color: '#ccc'},
-            xaxis: {showgrid: false, zeroline: false, color: '#888'},
-            yaxis: {scaleanchor: 'x', scaleratio: 1,
-                    showgrid: false, zeroline: false, color: '#888'},
-            margin: {l: 40, r: 60, t: 30, b: 30},
-        };
-        Plotly.newPlot(DIVS[p], [trace], layout, {responsive: true, displayModeBar: false});
-    }
-    updateInfo();
-}
-
-function updatePlots() {
-    for (let p = 0; p < 3; p++) {
-        const {colors, vmin, vmax} = extractColors(p, currentFrame, currentChannel);
-        Plotly.restyle(DIVS[p], {
-            'marker.color':              [colors],
-            'marker.cmin':               [vmin],
-            'marker.cmax':               [vmax],
-            'marker.colorscale':         [getCmap(p)],
-            'marker.colorbar.title.text':[cbTitle(p)],
-        });
-    }
-    const ft = META.frame_times[currentFrame];
-    document.getElementById('frame-label').textContent =
-        `Frame ${currentFrame} / ${FRAME_MAX}  (t=${ft})`;
-    document.getElementById('frame-slider').value = currentFrame;
-    updateInfo();
-}
-
-function updateInfo() {
-    const [vmin, vmax] = scaleMode === 'fixed'
-        ? META.clims_fixed[0][currentChannel]
-        : META.clims_dynamic[0][currentFrame][currentChannel];
-    document.getElementById('info-box').textContent =
-        `${META.ch_names[currentChannel]}  cmin:${vmin.toExponential(2)}  cmax:${vmax.toExponential(2)}`;
-}
-
-function setChannel(ch) {
-    currentChannel = ch;
-    document.querySelectorAll('.ch-btn').forEach((b, i) => b.classList.toggle('active', i === ch));
-    updatePlots();
-}
-
-function setFrame(f)  { currentFrame = f; updatePlots(); }
-function setScale(m)  { scaleMode = m;    updatePlots(); }
-
-function togglePlay() {
-    playing = !playing;
-    document.getElementById('play-btn').innerHTML = playing ? '&#9646;&#9646;' : '&#9654;';
-    if (playing) scheduleNext();
-    else if (animTimer) { clearTimeout(animTimer); animTimer = null; }
-}
-
-function scheduleNext() {
-    animTimer = setTimeout(() => {
-        if (!playing) return;
-        currentFrame = (currentFrame + 1) % META.n_frames;
-        updatePlots();
-        scheduleNext();
-    }, 80);
-}
-
-decodeData(ENCODED).then(data => {
-    DATA = data;
-    document.getElementById('loading').style.display      = 'none';
-    document.getElementById('controls').style.display     = 'flex';
-    document.getElementById('plots-container').style.display = 'flex';
-    initPlots();
-}).catch(err => {
-    document.getElementById('loading').textContent = 'Error: ' + err.message;
-    console.error(err);
-});
-"""
-
-        ch_buttons = ''.join(
-            f'<button class="ch-btn{" active" if i == 0 else ""}" '
-            f'onclick="setChannel({i})">{n}</button>'
-            for i, n in enumerate(ch_names)
-        )
-
-        html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>{case_name} \u2014 CFD Flow Visualization</title>
-{plotlyjs_tag}
-<style>
-body{{margin:0;background:#1a1a2e;color:#eee;font-family:monospace;overflow-x:hidden}}
-#controls{{padding:8px 12px;background:#16213e;display:flex;flex-wrap:wrap;gap:12px;
-           align-items:center;border-bottom:1px solid #333}}
-.ch-btn{{padding:4px 10px;border:1px solid #555;background:#2a2a4a;color:#ccc;
-         cursor:pointer;border-radius:4px;font-size:13px}}
-.ch-btn.active{{background:#0f3460;border-color:#4a9eff;color:#fff}}
-label{{cursor:pointer;font-size:13px}}
-#frame-label{{font-size:12px;color:#aaa;min-width:130px}}
-#frame-slider{{width:260px;cursor:pointer}}
-#info-box{{font-size:11px;color:#9a9;padding:2px 8px;background:#111;border-radius:3px}}
-#plots-container{{display:flex;width:100%;height:calc(100vh - 54px)}}
-.plot-div{{flex:1;min-width:0}}
-#loading{{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
-          font-size:18px;color:#4a9eff}}
-.play-btn{{padding:4px 10px;background:#0f3460;border:1px solid #4a9eff;
-           color:#fff;cursor:pointer;border-radius:4px;font-size:14px}}
-</style>
-</head>
-<body>
-<div id="loading">Loading data&#8230;</div>
-<div id="controls" style="display:none">
-  <div style="display:flex;gap:4px;align-items:center">
-    <span style="font-size:12px;color:#aaa;margin-right:4px">Channel:</span>
-    {ch_buttons}
-  </div>
-  <div style="display:flex;gap:10px;align-items:center">
-    <span style="font-size:12px;color:#aaa">Scale:</span>
-    <label><input type="radio" name="scale" value="fixed" checked
-                  onchange="setScale(this.value)"> Fixed</label>
-    <label><input type="radio" name="scale" value="dynamic"
-                  onchange="setScale(this.value)"> Dynamic</label>
-  </div>
-  <div style="display:flex;align-items:center;gap:8px">
-    <button class="play-btn" id="play-btn" onclick="togglePlay()">&#9654;</button>
-    <span id="frame-label">Frame 0 / {n_frames - 1}</span>
-    <input type="range" id="frame-slider" min="0" max="{n_frames - 1}" value="0"
-           oninput="setFrame(parseInt(this.value))">
-  </div>
-  <div id="info-box">\u2014</div>
-</div>
-<div id="plots-container" style="display:none">
-  <div id="plot-gt"   class="plot-div"></div>
-  <div id="plot-pred" class="plot-div"></div>
-  <div id="plot-err"  class="plot-div"></div>
-</div>
-<script>
-{data_js}
-{static_js}
-</script>
-</body>
-</html>"""
-
-        out_path = self.output_dir / f'{case_name}_interactive.html'
-        out_path.write_text(html, encoding='utf-8')
-        size_mb = out_path.stat().st_size / 1e6
-        logger.info(f'interactive HTML saved to {hue.g}{out_path}{hue.q} ({size_mb:.1f} MB)')
 
 
 if __name__ == '__main__':
