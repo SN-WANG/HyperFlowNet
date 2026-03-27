@@ -7,8 +7,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Any
 
-from wsnet.training.base_trainer import BaseTrainer
-from wsnet.training.base_criterion import NMSECriterion
+from training.base_trainer import BaseTrainer
+from training.base_criterion import NMSECriterion
 
 
 class TeacherForcingTrainer(BaseTrainer):
