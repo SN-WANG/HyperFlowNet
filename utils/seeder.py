@@ -11,7 +11,7 @@ except ImportError:
     _HAS_TORCH = False
     torch = None
 
-from wsnet.utils.hue_logger import hue, logger
+from utils.hue_logger import hue, logger
 
 
 def seed_everything(seed: int = 42) -> None:

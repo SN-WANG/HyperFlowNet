@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 from typing import List, Dict, Optional, Union, Tuple
 
-from wsnet.utils.hue_logger import hue, logger
+from utils.hue_logger import hue, logger
 
 
 class FlowData(Dataset):

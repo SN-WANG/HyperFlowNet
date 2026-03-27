@@ -7,9 +7,9 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Any, Optional
 
-from wsnet.training.base_trainer import BaseTrainer
-from wsnet.training.base_criterion import NMSECriterion
-from wsnet.utils.hue_logger import hue, logger
+from training.base_trainer import BaseTrainer
+from training.base_criterion import NMSECriterion
+from utils.hue_logger import hue, logger
 
 
 class RolloutTrainer(BaseTrainer):

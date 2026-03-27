@@ -5,7 +5,7 @@ import torch
 from torch import Tensor
 from typing import List, Dict, Any
 
-from wsnet.utils.hue_logger import hue, logger
+from utils.hue_logger import hue, logger
 
 
 class BoundaryCondition:

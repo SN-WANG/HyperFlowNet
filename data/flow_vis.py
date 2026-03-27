@@ -17,7 +17,7 @@ from torch import Tensor
 from tqdm.auto import tqdm
 import pyvista as pv
 
-from wsnet.utils.hue_logger import hue, logger
+from utils.hue_logger import hue, logger
 
 
 # ---------------------------------------------------------------------------
