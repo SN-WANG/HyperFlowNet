@@ -1,152 +1,242 @@
-# WSNet: A Deep Learning Library for Engineering Surrogate Modeling
+# HyperFlowNet
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/get-started/locally/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+HyperFlowNet is a research codebase for spatio-temporal neural operators on irregular CFD meshes. It targets autoregressive flow prediction from ANSYS Fluent style simulation data and provides a complete experimental workflow for training, long-horizon rollout inference, visualization, and baseline comparison.
 
-**WSNet** is an integrated deep learning library specifically designed for **high-fidelity surrogate modeling in engineering applications**. It provides a unified pipeline for **fluid dynamics emulation**, **structural analysis**, and **design optimization** with comprehensive support for classical surrogate models, neural networks, and modern neural operator algorithms.
+This repository is organized as experiment-oriented research code rather than a packaged software library. The focus is on making the core modeling pipeline easy to read, reproduce, and extend: model definitions, CFD data handling, rollout training, boundary-condition enforcement, and post-processing utilities are all kept close to the main experiment entry point.
 
-## 🏗 System Architecture
+## Highlights
 
-WSNet features a completely reorganized architecture with clear separation of concerns:
+- Irregular-mesh neural operator modeling for time-dependent flow fields
+- `HyperFlowNet` as the main model, with `GeoFNO` and `Transolver` baselines
+- Curriculum-based autoregressive rollout training with noise injection
+- Optional hard boundary-condition enforcement during rollout
+- Fluent-style sequence loading, caching, sliding-window augmentation, and normalization
+- Built-in rollout metrics, training curves, error heatmaps, and animation rendering
+- Pre-flight GPU memory probing before full training
 
-```
-wsnet/
-├── models/        # Surrogate models (classical, neural, multi-fidelity, ensemble)
-├── training/      # Training frameworks and utilities
-├── data/          # Data loading and preprocessing
-├── sampling/      # Design of Experiments and infill strategies
-└── utils/         # Core utilities
-```
+## Repository Layout
 
-### 1. Models (`models/`)
-A modular repository of surrogate models categorized by their mathematical formulation:
-
-* **`classical/`**: Classical response surface algorithms
-    * Includes: **PRS** (Polynomial Response Surface), **RBF** (Radial Basis Function), **KRG** (Kriging), **SVR** (Support Vector Regression)
-* **`neural/`**: Neural network models
-    * Includes: **MLP** (Multi-Layer Perceptron), **DeepONet**, **GeoFNO** (Geometry-aware Fourier Neural Operator), **HyperFlowNet**, **Transolver**
-* **`multi_fidelity/`**: Multi-fidelity models
-    * Includes: **CCA-MFS**, **MFS-MLS**, **MMFS**
-* **`ensemble/`**: Ensemble models
-    * Includes: **T-AHS**, **AES-MSI**
-
-### 2. Training (`training/`)
-Training frameworks and utilities:
-
-* **`base_trainer.py`**: Base trainer class for custom training workflows
-* **`std_trainer.py`**: Standard trainer for static regression tasks
-* **`rollout_trainer.py`**: Trainer for autoregressive sequence prediction
-* **`teacher_forcing_trainer.py`**: Teacher forcing trainer for sequence prediction
-* **`base_criterion.py`**: Loss functions and evaluation metrics
-
-### 3. Data (`data/`)
-Data loading and preprocessing utilities:
-
-* **`flow_data.py`**: CFD data loading and preprocessing
-* **`scaler.py`**: Data scaling utilities (StandardScaler, MinMaxScaler)
-* **`boundary.py`**: Boundary condition detection and enforcement
-* **`flow_vis.py`**: Flow field visualization and animation
-* **`flow_plot.py`**: Training curves, error heatmaps, and metrics plots
-
-### 4. Sampling (`sampling/`)
-Design of Experiments and infill strategies:
-
-* **`doe.py`**: Design of Experiments (LHS, optimized LHS)
-* **`base_infill.py`**: Base infill sampling strategy
-* **`so_infill.py`**: Single-objective infill strategy (Expected Improvement)
-* **`mo_infill.py`**: Multi-objective infill strategy
-* **`mf_infill.py`**: Multi-fidelity infill strategy
-
-### 5. Utilities (`utils/`)
-Core utilities and helper functions:
-
-* **`seeder.py`**: Reproducibility utilities (seed everything)
-* **`hue_logger.py`**: Colored logging with ANSI formatting
-* **`sweep.py`**: Hyperparameter sweep utilities
-
-## 🚀 Key Features
-
-* **CFD-Ready Pipeline**: Direct ingestion of ANSYS Fluent data with automatic coordinate and field mapping
-* **Physics-Informed Training**: Support for physics constraints and loss functions
-* **Multi-Fidelity Support**: Comprehensive multi-fidelity modeling capabilities
-* **Ensemble Methods**: Advanced ensemble techniques for improved accuracy
-* **Neural Operator Algorithms**: Modern neural operator implementations for complex physics
-* **Comprehensive Visualization Tools**: Built-in CFD visualization and rendering
-* **Standardized API**: Consistent "initialize, fit, predict" pattern across all models
-
-## 📚 API Reference
-
-### Core Classes
-
-- `wsnet.training.base_trainer.Trainer`: Base trainer interface
-- `wsnet.data.flow_data.FlowData`: CFD data loader
-- `wsnet.sampling.doe.lhs_design`: Optimized Latin Hypercube Sampling
-
-### Common Patterns
-
-The library follows a consistent "initialize, fit, predict" pattern:
-
-```python
-# Initialize
-model = SomeModel(parameters)
-
-# Fit/Train
-trainer = SomeTrainer(model=model)
-trainer.fit(train_data, val_data)
-
-# Predict
-predictions = model.predict(test_data)
+```text
+HyperFlowNet/
+├── main.py                  # Unified entry point for probe / train / infer
+├── config.py                # Command-line arguments and experiment configuration
+├── models/                  # HyperFlowNet and baseline neural operators
+│   ├── hyperflow_net.py
+│   ├── geofno.py
+│   └── transolver.py
+├── data/                    # CFD data loading, boundary handling, plotting, rendering
+│   ├── flow_data.py
+│   ├── boundary.py
+│   ├── flow_plot.py
+│   └── flow_vis.py
+├── training/                # Training loops, loss functions, and metrics
+│   ├── base_trainer.py
+│   ├── rollout_trainer.py
+│   ├── teacher_forcing_trainer.py
+│   └── base_criterion.py
+├── utils/                   # Shared utilities for scaling, logging, reproducibility
+│   ├── scaler.py
+│   ├── hue_logger.py
+│   ├── seeder.py
+│   └── sweep.py
+└── LICENSE
 ```
 
-## 🚀 Examples and Tutorials
+## Core Components
 
-Check the `examples/` directory for complete workflow examples:
+### Models
 
-- **`flow_config.py`** + **`flow_train.py`**: CFD emulation pipeline (HyperFlowNet / GeoFNO / Transolver) with training, inference, and visualization
-- **`aero_config.py`** + **`aero_demo.py`**: Aerodynamic optimization benchmark platform with ensemble, multi-fidelity, sequential sampling, and optimization demos
+- `models/hyperflow_net.py`
+  The main architecture in this repository. HyperFlowNet combines three ideas:
+  learnable Fourier feature encoding for irregular coordinates, sinusoidal temporal encoding for time-dependent rollout, and Physics Attention for compressing mesh-node interactions into slice tokens.
 
-## ⚙️ Installation and Dependencies
+- `models/geofno.py`
+  A geometry-aware Fourier neural operator baseline for comparison on the same CFD tasks.
 
-### Requirements
+- `models/transolver.py`
+  A mesh-based transformer baseline built around Physics Attention, included for fair comparison against HyperFlowNet.
 
-- Python 3.8+
-- PyTorch 1.10+
-- NumPy
-- SciPy
-- Matplotlib
-- PiVista
-- tqdm
+### Data Pipeline
 
-### Installation
+- `data/flow_data.py`
+  Loads raw ANSYS Fluent style text files, caches parsed tensors, supports spatial and temporal subsampling, and creates sliding-window training sequences for autoregressive learning.
+
+- `data/boundary.py`
+  Detects stationary wall nodes from training data and optionally enforces hard no-slip boundary conditions during rollout.
+
+- `utils/scaler.py`
+  Provides tensor and NumPy scalers used for feature standardization and coordinate normalization.
+
+### Training and Evaluation
+
+- `training/rollout_trainer.py`
+  Implements weighted full-rollout training with curriculum learning and input noise injection for stable long-horizon prediction.
+
+- `training/teacher_forcing_trainer.py`
+  Implements teacher-forcing training for baseline experiments.
+
+- `training/base_criterion.py`
+  Defines the normalized MSE loss and a metrics suite with global and step-wise evaluation for each physical channel.
+
+### Visualization and Analysis
+
+- `data/flow_vis.py`
+  Renders animated comparisons between prediction and ground truth using PyVista, including support for headless GPU environments.
+
+- `data/flow_plot.py`
+  Generates training curves, rollout error plots, error heatmaps, metric summaries, and ablation-oriented visual outputs.
+
+### Experiment Entry Point
+
+- `main.py`
+  Orchestrates the full workflow:
+  dataset loading, scaler fitting, model construction, training, checkpoint restore, rollout inference, plotting, animation generation, and GPU memory probing.
+
+- `config.py`
+  Centralizes model, optimization, curriculum, data, and runtime arguments behind a single command-line interface.
+
+## Expected Data Format
+
+The default dataset layout is:
+
+```text
+dataset/
+├── raw_data/
+│   ├── case_0001/
+│   │   ├── frame_0000.txt
+│   │   ├── frame_0001.txt
+│   │   └── ...
+│   ├── case_0002/
+│   └── ...
+├── case_0001.pt
+├── case_0002.pt
+└── ...
+```
+
+Each raw text file is expected to follow the Fluent-style convention used by `FlowData`:
+
+- 2D case: `[Index, x, y, P, Vx, Vy, T]`
+- 3D case: `[Index, x, y, z, P, Vx, Vy, Vz, T]`
+
+Parsed cases are cached as `.pt` files after the first load.
+
+## Running Experiments
+
+The repository is centered around `main.py`, which supports three execution modes:
+`probe`, `train`, and `infer`.
+
+### Probe GPU memory before training
 
 ```bash
-git clone https://github.com/SN-WANG/wsnet.git
-cd wsnet
-pip install -e .
+python main.py --mode probe --model_type hyperflownet
 ```
 
-## 📄 License
+This runs a real forward-backward rollout step and reports peak VRAM usage before a full experiment.
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+### Train HyperFlowNet
 
-## 📞 Contact
-
-For questions and support, please contact:
-- Shengning Wang (王晟宁) - snwang2023@163.com
-- Project Website: [https://github.com/SN-WANG/wsnet](https://github.com/SN-WANG/wsnet)
-
-## 📖 Citation
-
-If you use WSNet in your research, please cite:
-
+```bash
+python main.py \
+  --mode train \
+  --model_type hyperflownet \
+  --trainer_type rollout \
+  --data_dir ./dataset \
+  --output_dir ./runs/hyperflownet
 ```
-@software{wsnet2026,
+
+### Run inference and generate visualizations
+
+```bash
+python main.py \
+  --mode infer \
+  --model_type hyperflownet \
+  --trainer_type rollout \
+  --data_dir ./dataset \
+  --output_dir ./runs/hyperflownet
+```
+
+### Run a baseline
+
+```bash
+python main.py \
+  --mode train infer \
+  --model_type transolver \
+  --trainer_type teacher_forcing \
+  --data_dir ./dataset \
+  --output_dir ./runs/transolver
+```
+
+## Experiment Workflow
+
+The default HyperFlowNet workflow is:
+
+1. Parse CFD cases and build sliding-window sequences.
+2. Fit feature and coordinate scalers from the training split.
+3. Detect wall nodes for optional hard boundary enforcement.
+4. Train with weighted autoregressive rollout loss.
+5. Increase rollout horizon gradually through curriculum learning.
+6. Restore checkpoints for test-time rollout prediction.
+7. Generate metrics, plots, animations, and saved prediction tensors.
+
+## Configuration
+
+`config.py` organizes the CLI into the following groups:
+
+- `General`: runtime mode, output paths, random seed, device
+- `Data`: dataset location, spatial dimension, batch size, window slicing
+- `Model Selection`: model family and trainer type
+- `Architecture (Common)`: shared depth and width
+- `HyperFlowNet`: slices, heads, temporal encoding, spatial encoding, hard BC
+- `GeoFNO`: Fourier modes, latent grid, deformation network
+- `Transolver`: slices, heads, MLP ratio, dropout
+- `Optimization`: learning rate, weight decay, epoch budget, channel weights
+- `Curriculum`: maximum rollout length, patience, noise schedule
+
+## What the Code Produces
+
+For a typical run, the output directory contains:
+
+- `ckpt.pt`: latest checkpoint
+- `best.pt`: best validation checkpoint
+- `history.json`: training history
+- `test_metrics.json`: per-case and per-channel evaluation metrics
+- `*_pred.pt`: predicted rollout tensors
+- `training_curve.png`: learning curves
+- `metrics_comparison.png`: aggregated evaluation plots
+- `*_rollout_error.png`: per-case rollout error plots
+- `*_error_*.png`: spatial error heatmaps
+- rendered animations generated by `FlowVis`
+
+## Code Organization
+
+The repository follows a straightforward research-code layout:
+
+- `main.py` is the single entry point for the full experiment pipeline.
+- `config.py` defines the runtime and model configuration space.
+- `models/` contains the main architecture and baseline neural operators.
+- `data/` contains CFD-specific loading, preprocessing, plotting, and rendering code.
+- `training/` contains the rollout logic, baseline trainer, losses, and metrics.
+- `utils/` contains shared helpers such as scaling, logging, seeding, and repository utilities.
+
+For a research repository, these names are clear and conventional. They make it easy to navigate the code by function without introducing extra packaging layers that are not needed for day-to-day experimentation.
+
+## Dependency Context
+
+This project is developed alongside `WSNet` and reuses some of its broader core abstractions. HyperFlowNet itself keeps the flow-specific research logic local: the dataset loader, neural operator models, rollout procedure, visualization pipeline, and experiment-facing command-line configuration.
+
+## Citation
+
+If this repository is useful in your work, please cite it as a software project.
+
+```bibtex
+@software{hyperflownet2026,
   author = {Shengning Wang},
-  title = {WSNet: A Deep Learning Library for Engineering Surrogate Modeling},
+  title = {HyperFlowNet},
   year = {2026},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/SN-WANG/wsnet}}
+  url = {https://github.com/SN-WANG/HyperFlowNet}
 }
 ```
+
+## License
+
+This project is released under the MIT License. See [LICENSE](LICENSE) for details.

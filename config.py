@@ -15,7 +15,7 @@ def get_args() -> argparse.Namespace:
         argparse.Namespace: Parsed arguments containing all hyperparameters.
     """
     parser = argparse.ArgumentParser(
-        description="HyperFlowNet: Grid-Free Neural Operator for Flow Simulation",
+        description="HyperFlowNet: A Spatio-Temporal Neural Operator for Flow Simulation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -30,8 +30,9 @@ def get_args() -> argparse.Namespace:
         "--output_dir", type=str, default="./runs",
         help="Directory to save checkpoints, logs, and visualizations.")
     general.add_argument(
-        "--mode", type=str, default="train_infer_probe",
-        help="Execution mode. Combine: train, infer, probe (e.g., 'train_infer').")
+        "--mode", type=str, nargs='+', default=["train", "infer", "probe"],
+        choices=["train", "infer", "probe"],
+        help="Execution phases to run (space-separated, e.g., --mode train infer).")
     general.add_argument(
         "--device", type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -51,7 +52,7 @@ def get_args() -> argparse.Namespace:
         "--spatial_dim", type=int, default=2, choices=[2, 3],
         help="Spatial dimensionality of the mesh (2D or 3D).")
     data.add_argument(
-        "--win_len", type=int, default=8,
+        "--win_len", type=int, default=13,
         help="Temporal window length for sequence slicing (input + target).")
     data.add_argument(
         "--win_stride", type=int, default=1,
@@ -102,7 +103,7 @@ def get_args() -> argparse.Namespace:
     # Ablation switches
     hfn.add_argument(
         "--use_spatial_encoding", action=argparse.BooleanOptionalAction, default=True,
-        help="Enable RFF spatial encoding. Disable for ablation (--no-use_spatial_encoding).")
+        help="Enable LFF spatial encoding. Disable for ablation (--no-use_spatial_encoding).")
     hfn.add_argument(
         "--use_temporal_encoding", action=argparse.BooleanOptionalAction, default=True,
         help="Enable sinusoidal temporal encoding. Disable for ablation.")
@@ -119,18 +120,15 @@ def get_args() -> argparse.Namespace:
     # Spatial encoding
     hfn.add_argument(
         "--coord_features", type=int, default=8,
-        help="RFF half-dimension (output: 2 * coord_features). Set 0 for raw coords.")
-    hfn.add_argument(
-        "--coord_sigma", type=float, default=1.0,
-        help="RFF projection scale controlling spatial frequency bandwidth.")
+        help="LFF half-dimension (output: 2 * coord_features). Set 0 for raw coords.")
 
     # Temporal encoding
     hfn.add_argument(
         "--time_features", type=int, default=4,
         help="Sinusoidal PE half-dimension (output: 2 * time_features).")
     hfn.add_argument(
-        "--max_steps", type=int, default=1000,
-        help="Reference max time step for sinusoidal frequency scaling.")
+        "--freq_base", type=int, default=1000,
+        help="Base for sinusoidal frequency decay (analogous to 10000 in Transformer PE).")
 
     # ==================================================================
     # 6. GeoFNO-Specific Parameters
@@ -177,21 +175,25 @@ def get_args() -> argparse.Namespace:
         "--weight_decay", type=float, default=1e-4,
         help="L2 regularization coefficient for AdamW.")
     optim.add_argument(
-        "--max_epochs", type=int, default=300,
+        "--max_epochs", type=int, default=560,
         help="Maximum number of training epochs.")
     optim.add_argument(
         "--eta_min", type=float, default=1e-6,
         help="Minimum learning rate for cosine annealing scheduler.")
+    optim.add_argument(
+        "--channel_weights", type=float, nargs='+', default=[1.0, 3.0, 1.0, 1.0],
+        help="Per-channel NMSE loss weights for [Vx, Vy, P, T]. "
+             "Default: Vy 3x weighted to improve Y-velocity prediction.")
 
     # ==================================================================
-    # 9. Curriculum Learning (Rollout Trainer Only)
+    # 9. Curriculum Learning
     # ==================================================================
     curriculum = parser.add_argument_group("Curriculum (Rollout Trainer)")
     curriculum.add_argument(
-        "--max_rollout_steps", type=int, default=7,
+        "--max_rollout_steps", type=int, default=12,
         help="Maximum autoregressive rollout steps (curriculum ceiling).")
     curriculum.add_argument(
-        "--rollout_patience", type=int, default=40,
+        "--rollout_patience", type=int, default=55,
         help="Epochs between curriculum difficulty advances.")
     curriculum.add_argument(
         "--noise_std_init", type=float, default=0.01,

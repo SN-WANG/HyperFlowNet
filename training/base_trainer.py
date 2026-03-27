@@ -16,7 +16,6 @@ from typing import List, Dict, Any, Optional, Union
 from wsnet.data.scaler import StandardScalerTensor
 from wsnet.utils.hue_logger import hue, logger
 
-
 class BaseTrainer:
     """
     Base class encapsulating the training loop, checkpointing, and evaluation logic.

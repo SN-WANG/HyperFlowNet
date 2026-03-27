@@ -1,8 +1,6 @@
-# Main Script for Flow Simulation: Training, Inference, and Baseline Comparison
+# Main Script for HyperFlowNet: Training, Inference, and Baseline Comparison
 # Author: Shengning Wang
 
-import os
-import sys
 import json
 import torch
 import argparse
@@ -12,31 +10,27 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from typing import Dict, Tuple
 
-import flow_config
+import config
 
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if project_root not in sys.path: sys.path.insert(0, project_root)
+from models.geofno import GeoFNO
+from models.hyperflow_net import HyperFlowNet
+from models.transolver import Transolver
 
-
-from wsnet.models.neural.geofno import GeoFNO
-from wsnet.models.neural.hyperflownet import HyperFlowNet
-from wsnet.models.neural.transolver import Transolver
-
-from wsnet.data.flow_data import FlowData
-from wsnet.data.flow_vis import FlowVis
-from wsnet.data.boundary import BoundaryCondition
-from wsnet.data.flow_plot import (
+from data.flow_data import FlowData
+from data.flow_vis import FlowVis
+from data.boundary import BoundaryCondition
+from data.flow_plot import (
     plot_training_curves, plot_rollout_error,
     plot_error_heatmap, plot_metrics_comparison,
 )
-from wsnet.data.scaler import StandardScalerTensor, MinMaxScalerTensor
 
-from wsnet.training.rollout_trainer import RolloutTrainer
-from wsnet.training.teacher_forcing_trainer import TeacherForcingTrainer
-from wsnet.training.base_criterion import Metrics, NMSECriterion
+from training.rollout_trainer import RolloutTrainer
+from training.teacher_forcing_trainer import TeacherForcingTrainer
+from training.base_criterion import Metrics, NMSECriterion
 
-from wsnet.utils.seeder import seed_everything
-from wsnet.utils.hue_logger import hue, logger
+from utils.scaler import StandardScalerTensor, MinMaxScalerTensor
+from utils.seeder import seed_everything
+from utils.hue_logger import hue, logger
 
 
 # ======================================================================
@@ -98,8 +92,8 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
             use_spatial_encoding=args.use_spatial_encoding,
             use_temporal_encoding=args.use_temporal_encoding,
             # Encoding params
-            coord_features=args.coord_features, coord_sigma=args.coord_sigma,
-            time_features=args.time_features, max_steps=args.max_steps,
+            coord_features=args.coord_features,
+            time_features=args.time_features, freq_base=args.freq_base,
         )
 
     elif args.model_type == "geofno":
@@ -157,6 +151,7 @@ def _build_trainer(args: argparse.Namespace, model: torch.nn.Module,
             rollout_patience=args.rollout_patience,
             noise_std_init=args.noise_std_init, noise_decay=args.noise_decay,
             boundary_condition=boundary_condition,
+            channel_weights=args.channel_weights,
         )
 
     elif args.trainer_type == "teacher_forcing":
@@ -318,8 +313,10 @@ def inference_pipeline(args: argparse.Namespace) -> None:
             for ch in args.channel_names:
                 nmse = metrics[ch]["global"]["nmse"]
                 r2 = metrics[ch]["global"]["r2"]
+                accuracy = metrics[ch]["global"]["accuracy"]
                 log_metrics.append(
-                    f"{hue.c}{ch}:{hue.q} NMSE={hue.m}{nmse:.2e}{hue.q}, R2={hue.m}{r2:.4f}{hue.q}"
+                    f"{hue.c}{ch}:{hue.q} NMSE={hue.m}{nmse:.2e}{hue.q}, "
+                    f"R2={hue.m}{r2:.4f}{hue.q}, ACC={hue.m}{accuracy:.2f}%{hue.q}"
                 )
 
             logger.info(f"case {hue.b}{case_name}{hue.q} | " + " | ".join(log_metrics))
@@ -417,7 +414,7 @@ def probe_pipeline(args: argparse.Namespace) -> None:
                 f"model={hue.b}{args.model_type}{hue.q}")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = NMSECriterion()
+    criterion = NMSECriterion(channel_weights=args.channel_weights)
 
     # --- Forward / Backward ---
     torch.cuda.reset_peak_memory_stats(device)
@@ -461,7 +458,7 @@ def probe_pipeline(args: argparse.Namespace) -> None:
 # ======================================================================
 
 if __name__ == "__main__":
-    args = flow_config.get_args()
+    args = config.get_args()
 
     if "probe" in args.mode: probe_pipeline(args)
     if "train" in args.mode: train_pipeline(args)

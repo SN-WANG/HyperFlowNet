@@ -82,7 +82,8 @@ class RolloutTrainer(BaseTrainer):
             scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=eta_min)
 
         if criterion is None:
-            criterion = NMSECriterion()
+            channel_weights = kwargs.pop("channel_weights", None)
+            criterion = NMSECriterion(channel_weights=channel_weights)
 
         super().__init__(model, lr=lr, max_epochs=max_epochs,
                          optimizer=optimizer, scheduler=scheduler, criterion=criterion, **kwargs)

@@ -34,18 +34,29 @@ class BaseCriterion(nn.Module):
 
 
 class NMSECriterion(BaseCriterion):
-    """Per-channel Normalized Mean Squared Error loss.
+    """Per-channel Normalized Mean Squared Error loss with optional channel weighting.
 
-    Computes per-channel NMSE and sums across channels:
-        L = sum_c ||target_c - pred_c||^2 / (||target_c||^2 + eps)
+    Computes per-channel NMSE and returns the (weighted) average across channels:
+        L = sum_c (w_c * NMSE_c) / sum_c(w_c)
+    where NMSE_c = ||target_c - pred_c||^2 / (||target_c||^2 + eps).
 
     Each channel is independently normalized by its own energy, preventing
-    high-energy channels from dominating the gradient signal.
+    high-energy channels from dominating the gradient signal. Optional
+    channel_weights control the relative importance of each channel without
+    affecting the overall loss magnitude (e.g., up-weighting a sparse
+    Y-velocity field).
     """
 
-    def __init__(self, eps: float = 1e-8):
+    def __init__(self, eps: float = 1e-8, channel_weights: Optional[List[float]] = None):
         super().__init__()
         self.eps = eps
+        if channel_weights is not None:
+            self.register_buffer(
+                "channel_weights",
+                torch.tensor(channel_weights, dtype=torch.float32),
+            )
+        else:
+            self.channel_weights = None
 
     def forward(self, pred: Tensor, target: Tensor, **kwargs) -> Tensor:
         if pred.shape != target.shape:
@@ -56,7 +67,11 @@ class NMSECriterion(BaseCriterion):
         sq_err = (target - pred) ** 2
         mse_c = sq_err.reshape(-1, C).sum(0)              # (C,)
         norm_c = (target ** 2).reshape(-1, C).sum(0) + self.eps  # (C,)
-        return (mse_c / norm_c).sum()
+        nmse_c = mse_c / norm_c  # (C,)
+        if self.channel_weights is not None:
+            nmse_c = nmse_c * self.channel_weights.to(nmse_c.device)
+            return nmse_c.sum() / self.channel_weights.sum()
+        return nmse_c.mean()
 
 
 class Metrics:
@@ -66,7 +81,7 @@ class Metrics:
     for each channel in multivariate predictions.
     """
 
-    SUPPORTED_METRICS = ("nmse", "mse", "rmse", "mae", "r2", "max_error")
+    SUPPORTED_METRICS = ("nmse", "mse", "rmse", "mae", "r2", "accuracy", "max_error")
 
     def __init__(self, channel_names: List[str], metrics: Optional[List[str]] = None):
         if metrics is None:
@@ -117,6 +132,7 @@ class Metrics:
 
             # Global metrics (aggregate over all timesteps and nodes)
             abs_diff = torch.abs(target_c - pred_c)
+            abs_target = torch.abs(target_c)
             sq_diff = (target_c - pred_c) ** 2
 
             for metric_name in self.metrics:
@@ -137,6 +153,11 @@ class Metrics:
                     ss_tot = torch.sum((target_c - torch.mean(target_c)) ** 2).item()
                     r2_val = 1.0 - (ss_res / (ss_tot + 1e-8))
                     channel_result["global"][metric_name] = r2_val
+                elif metric_name == "accuracy":
+                    accuracy_val = (
+                        1.0 - torch.sum(abs_diff) / (torch.sum(abs_target) + 1e-8)
+                    ) * 100.0
+                    channel_result["global"][metric_name] = accuracy_val.item()
                 elif metric_name == "max_error":
                     max_val = torch.max(abs_diff).item()
                     channel_result["global"][metric_name] = max_val
@@ -164,6 +185,11 @@ class Metrics:
                     channel_result["step_wise"][metric_name] = (
                         (1.0 - step_ss_res / (step_ss_tot + 1e-8)).tolist()
                     )
+                elif metric_name == "accuracy":
+                    step_accuracy = (
+                        1.0 - torch.sum(abs_diff, dim=1) / (torch.sum(abs_target, dim=1) + 1e-8)
+                    ) * 100.0
+                    channel_result["step_wise"][metric_name] = step_accuracy.tolist()
                 elif metric_name == "max_error":
                     channel_result["step_wise"][metric_name] = torch.max(
                         abs_diff, dim=1
