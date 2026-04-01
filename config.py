@@ -84,51 +84,27 @@ def get_args() -> argparse.Namespace:
     arch = parser.add_argument_group("Architecture (Common)")
     arch.add_argument(
         "--depth", type=int, default=4,
-        help="Number of stacked transformer/operator blocks.")
+        help="Number of stacked latent transformer blocks.")
     arch.add_argument(
         "--width", type=int, default=128,
         help="Hidden channel dimension.")
+    arch.add_argument(
+        "--dropout", type=float, default=0.0,
+        help="Dropout rate in attention and feedforward layers.")
 
     # ==================================================================
     # 5. HyperFlowNet-Specific Parameters
     # ==================================================================
     hfn = parser.add_argument_group("HyperFlowNet")
     hfn.add_argument(
-        "--num_slices", type=int, default=32,
-        help="Number of mesh slice tokens (M). Higher M captures more physics modes.")
-    hfn.add_argument(
         "--num_heads", type=int, default=8,
-        help="Number of attention heads for slice-space MHA.")
-
-    # Ablation switches
+        help="Number of attention heads in latent attention.")
     hfn.add_argument(
-        "--use_spatial_encoding", action=argparse.BooleanOptionalAction, default=True,
-        help="Enable LFF spatial encoding. Disable for ablation (--no-use_spatial_encoding).")
+        "--num_latents", type=int, default=64,
+        help="Number of learnable latent tokens.")
     hfn.add_argument(
-        "--use_temporal_encoding", action=argparse.BooleanOptionalAction, default=True,
-        help="Enable sinusoidal temporal encoding. Disable for ablation.")
-
-    # Boundary condition enforcement
-    hfn.add_argument(
-        "--use_hard_bc", action=argparse.BooleanOptionalAction, default=True,
-        help="Enable hard boundary condition enforcement during rollout. "
-             "Replaces wall-node velocity predictions with known no-slip values.")
-    hfn.add_argument(
-        "--velocity_threshold", type=float, default=1e-4,
-        help="Velocity magnitude threshold for data-driven wall node detection.")
-
-    # Spatial encoding
-    hfn.add_argument(
-        "--coord_features", type=int, default=8,
-        help="LFF half-dimension (output: 2 * coord_features). Set 0 for raw coords.")
-
-    # Temporal encoding
-    hfn.add_argument(
-        "--time_features", type=int, default=4,
-        help="Sinusoidal PE half-dimension (output: 2 * time_features).")
-    hfn.add_argument(
-        "--freq_base", type=int, default=1000,
-        help="Base for sinusoidal frequency decay (analogous to 10000 in Transformer PE).")
+        "--ffn_ratio", type=float, default=4.0,
+        help="Feedforward expansion ratio relative to width.")
 
     # ==================================================================
     # 6. GeoFNO-Specific Parameters
@@ -160,9 +136,6 @@ def get_args() -> argparse.Namespace:
     tsv.add_argument(
         "--mlp_ratio", type=int, default=1,
         help="MLP hidden size multiplier (hidden = width * mlp_ratio).")
-    tsv.add_argument(
-        "--dropout", type=float, default=0.0,
-        help="Dropout rate in Transolver attention and MLP.")
 
     # ==================================================================
     # 8. Optimization

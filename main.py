@@ -18,7 +18,6 @@ from models.transolver import Transolver
 
 from data.flow_data import FlowData
 from data.flow_vis import FlowVis
-from data.boundary import BoundaryCondition
 from data.flow_plot import (
     plot_training_curves, plot_rollout_error,
     plot_error_heatmap, plot_metrics_comparison,
@@ -87,13 +86,10 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
             in_channels=in_ch, out_channels=out_ch,
             spatial_dim=args.spatial_dim,
             width=args.width, depth=args.depth,
-            num_slices=args.num_slices, num_heads=args.num_heads,
-            # Ablation switches
-            use_spatial_encoding=args.use_spatial_encoding,
-            use_temporal_encoding=args.use_temporal_encoding,
-            # Encoding params
-            coord_features=args.coord_features,
-            time_features=args.time_features, freq_base=args.freq_base,
+            num_heads=args.num_heads,
+            num_latents=args.num_latents,
+            ffn_ratio=args.ffn_ratio,
+            dropout=args.dropout,
         )
 
     elif args.model_type == "geofno":
@@ -126,7 +122,7 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
 # ======================================================================
 
 def _build_trainer(args: argparse.Namespace, model: torch.nn.Module,
-                   scalers: Dict, output_dir: Path, boundary_condition=None):
+                   scalers: Dict, output_dir: Path):
     """Instantiate the trainer selected by --trainer_type.
 
     Args:
@@ -134,8 +130,6 @@ def _build_trainer(args: argparse.Namespace, model: torch.nn.Module,
         model: The model to train.
         scalers: Dictionary of data scalers for checkpoint saving.
         output_dir: Directory for saving artifacts.
-        boundary_condition: Optional BoundaryCondition for hard BC enforcement.
-
     Returns:
         Configured trainer instance.
 
@@ -150,7 +144,6 @@ def _build_trainer(args: argparse.Namespace, model: torch.nn.Module,
             max_rollout_steps=args.max_rollout_steps,
             rollout_patience=args.rollout_patience,
             noise_std_init=args.noise_std_init, noise_decay=args.noise_decay,
-            boundary_condition=boundary_condition,
             channel_weights=args.channel_weights,
         )
 
@@ -195,15 +188,6 @@ def train_pipeline(args: argparse.Namespace) -> None:
     coord_scaler = MinMaxScalerTensor(norm_range="bipolar").fit(train_coords, channel_dim=-1)
     scalers = {"feature_scaler": feature_scaler, "coord_scaler": coord_scaler}
 
-    # --- Boundary Condition Detection ---
-    bc = None
-    if getattr(args, "use_hard_bc", False):
-        bc = BoundaryCondition()
-        bc.fit(train_raw, feature_scaler,
-               velocity_channels=list(range(args.spatial_dim)),
-               velocity_threshold=args.velocity_threshold)
-        scalers["boundary_condition"] = bc
-
     train_dataset = ScaledCFDataset(train_raw, feature_scaler=feature_scaler,
                                     coord_scaler=coord_scaler)
     val_dataset = ScaledCFDataset(val_raw, feature_scaler=feature_scaler,
@@ -223,7 +207,7 @@ def train_pipeline(args: argparse.Namespace) -> None:
     logger.info(f"model has {hue.m}{num_params}{hue.q} parameters")
 
     # --- Training ---
-    trainer = _build_trainer(args, model, scalers, output_dir, boundary_condition=bc)
+    trainer = _build_trainer(args, model, scalers, output_dir)
     trainer.fit(train_loader, val_loader)
 
 
@@ -252,15 +236,6 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     feature_scaler.load_state_dict(checkpoint["scaler_state_dict"]["feature_scaler"])
     coord_scaler = MinMaxScalerTensor(norm_range="bipolar")
     coord_scaler.load_state_dict(checkpoint["scaler_state_dict"]["coord_scaler"])
-
-    # --- Restore Boundary Condition (if saved) ---
-    bc = None
-    scaler_state = checkpoint["scaler_state_dict"]
-    if "boundary_condition" in scaler_state:
-        bc = BoundaryCondition()
-        bc.load_state_dict(scaler_state["boundary_condition"])
-        logger.info(f"boundary condition restored: "
-                    f"{hue.m}{int(bc.wall_mask.sum())}{hue.q} wall nodes")
 
     # --- Data Preparation ---
     _, _, test_raw = FlowData.spawn(
@@ -299,8 +274,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
             initial_state = seq_std[:, 0]
             coords_raw = test_raw.coords[i].cpu()
 
-            pred_seq_std = model.predict(initial_state, coords_norm, steps,
-                                         boundary_condition=bc)
+            pred_seq_std = model.predict(initial_state, coords_norm, steps)
 
             pred_seq = feature_scaler.inverse_transform(pred_seq_std).cpu().squeeze(0)
             gt_seq = feature_scaler.inverse_transform(seq_std).cpu().squeeze(0)
