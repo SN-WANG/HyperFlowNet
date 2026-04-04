@@ -4,25 +4,25 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-**HyperFlowNet** is the CFD-focused repository in the WSNet family. It inherits core training, scaling, and utility conventions from [WSNet](https://github.com/SN-WANG/WSNet), while concentrating on irregular-mesh autoregressive flow prediction from Fluent-style simulation data.
+**HyperFlowNet** is the CFD-focused repository in the WSNet family. It inherits the core training style, scaling tools, and utility conventions from [WSNet](https://github.com/SN-WANG/WSNet), while concentrating on lightweight irregular-mesh autoregressive flow prediction from Fluent-style simulation data.
 
 ## 📌 Overview
 
 HyperFlowNet keeps the full workflow for this task in one place:
-data loading, rollout training, inference, visualization, and baseline comparison.
+data loading, staged rollout training, inference, visualization, and memory probing.
 
 The current scope includes:
 
 - irregular-mesh spatio-temporal flow prediction
-- autoregressive rollout training
-- baseline comparison with `GeoFNO` and `Transolver`
+- staged autoregressive rollout training
 - rollout metrics, plots, and animation rendering
+- GPU memory probing before full training
 
 ## ✨ Highlights
 
-- `HyperFlowNet` as the main model, with `GeoFNO` and `Transolver` baselines
-- Curriculum-based autoregressive rollout training with noise injection
-- Optional hard boundary-condition enforcement during rollout
+- `HyperFlowNet` as the single maintained model
+- A dedicated `HyperFlowTrainer` built on top of WSNet-style `BaseTrainer`
+- Staged rollout curriculum with scheduled sampling, stage-wise learning rate, and noise injection
 - Fluent-style sequence loading, caching, sliding-window augmentation, and normalization
 - Built-in rollout metrics, training curves, error heatmaps, and animation rendering
 - GPU memory probing before full training
@@ -34,9 +34,7 @@ HyperFlowNet/
 ├── main.py                  # Unified entry point for probe / train / infer
 ├── config.py                # Command-line arguments and experiment configuration
 ├── models/
-│   ├── hyperflow_net.py
-│   ├── geofno.py
-│   └── transolver.py
+│   └── hflownet.py
 ├── data/
 │   ├── flow_data.py
 │   ├── boundary.py
@@ -44,14 +42,12 @@ HyperFlowNet/
 │   └── flow_vis.py
 ├── training/
 │   ├── base_trainer.py
-│   ├── rollout_trainer.py
-│   ├── teacher_forcing_trainer.py
-│   └── base_criterion.py
+│   └── hyperflow_trainer.py
 ├── utils/
 │   ├── scaler.py
 │   ├── hue_logger.py
 │   ├── seeder.py
-│   └── sweep.py
+│   └── sweeper.py
 ├── README.md
 └── LICENSE
 ```
@@ -68,7 +64,7 @@ cd HyperFlowNet
 ### Probe GPU memory before training
 
 ```bash
-python main.py --mode probe --model_type hyperflownet
+python main.py --mode probe
 ```
 
 ### Train HyperFlowNet
@@ -76,8 +72,6 @@ python main.py --mode probe --model_type hyperflownet
 ```bash
 python main.py \
   --mode train \
-  --model_type hyperflownet \
-  --trainer_type rollout \
   --data_dir ./dataset \
   --output_dir ./runs/hyperflownet
 ```
@@ -87,8 +81,6 @@ python main.py \
 ```bash
 python main.py \
   --mode infer \
-  --model_type hyperflownet \
-  --trainer_type rollout \
   --data_dir ./dataset \
   --output_dir ./runs/hyperflownet
 ```
