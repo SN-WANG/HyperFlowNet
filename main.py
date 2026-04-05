@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 import config
 
 from data.flow_data import FlowData
+from data.boundary import BoundaryCondition
 from data.flow_plot import (
     plot_error_heatmap,
     plot_metrics_comparison,
@@ -287,6 +288,7 @@ def build_trainer(
     model: HyperFlowNet,
     scalers: Dict[str, object],
     output_dir: Path,
+    boundary_condition: BoundaryCondition | None = None,
 ) -> HyperFlowTrainer:
     """
     Build the HyperFlowNet trainer.
@@ -296,6 +298,7 @@ def build_trainer(
         model (HyperFlowNet): HyperFlowNet model.
         scalers (Dict[str, object]): Fitted scalers to be stored in checkpoints.
         output_dir (Path): Output directory.
+        boundary_condition (BoundaryCondition | None): Optional hard boundary-condition enforcer.
 
     Returns:
         HyperFlowTrainer: Initialized trainer.
@@ -306,8 +309,6 @@ def build_trainer(
         max_epochs=args.max_epochs,
         patience=args.patience,
         weight_decay=args.weight_decay,
-        grad_clip=args.grad_clip,
-        use_amp=args.use_amp,
         rollout_steps=args.rollout_steps,
         stage_ratios=args.stage_ratios,
         teacher_forcing_lows=args.teacher_forcing_lows,
@@ -321,6 +322,7 @@ def build_trainer(
         delta_loss_weight=args.delta_loss_weight,
         step_weight_power=args.step_weight_power,
         loss_eps=args.loss_eps,
+        boundary_condition=boundary_condition,
         scalers=scalers,
         output_dir=output_dir,
         device=args.device,
@@ -373,7 +375,7 @@ def restore_scalers(checkpoint: Dict[str, object]) -> Dict[str, object]:
         checkpoint (Dict[str, object]): Loaded checkpoint payload.
 
     Returns:
-        Dict[str, object]: Restored scalers.
+        Dict[str, object]: Restored scalers and optional boundary condition.
     """
     feature_scaler = StandardScalerTensor()
     feature_scaler.load_state_dict(checkpoint["scaler_state_dict"]["feature_scaler"])
@@ -381,10 +383,17 @@ def restore_scalers(checkpoint: Dict[str, object]) -> Dict[str, object]:
     coord_scaler = MinMaxScalerTensor(norm_range="bipolar")
     coord_scaler.load_state_dict(checkpoint["scaler_state_dict"]["coord_scaler"])
 
-    return {
+    scalers = {
         "feature_scaler": feature_scaler,
         "coord_scaler": coord_scaler,
     }
+    boundary_state = checkpoint["scaler_state_dict"].get("boundary_condition")
+    if boundary_state is not None:
+        boundary_condition = BoundaryCondition()
+        boundary_condition.load_state_dict(boundary_state)
+        scalers["boundary_condition"] = boundary_condition
+
+    return scalers
 
 
 def train_pipeline(args: argparse.Namespace) -> None:
@@ -401,6 +410,16 @@ def train_pipeline(args: argparse.Namespace) -> None:
     logger.info("loading datasets...")
     train_data, val_data, _ = build_case_datasets(args)
     scalers = fit_scalers(train_data)
+    boundary_condition = None
+
+    if args.use_hard_bc:
+        boundary_condition = BoundaryCondition().fit(
+            train_data,
+            scalers["feature_scaler"],
+            velocity_channels=list(range(args.spatial_dim)),
+            velocity_threshold=args.velocity_threshold,
+        )
+        scalers["boundary_condition"] = boundary_condition
 
     logger.info("building training windows...")
     FlowData.augment_windows(train_data, args.win_len, args.train_win_stride)
@@ -413,7 +432,7 @@ def train_pipeline(args: argparse.Namespace) -> None:
     logger.info(f"model parameters: {hue.m}{num_params}{hue.q}")
     save_run_config(args, output_dir, num_params)
 
-    trainer = build_trainer(args, model, scalers, output_dir)
+    trainer = build_trainer(args, model, scalers, output_dir, boundary_condition=boundary_condition)
     trainer.fit(train_loader, val_loader)
 
     history_path = output_dir / "history.json"
@@ -439,6 +458,12 @@ def inference_pipeline(args: argparse.Namespace) -> None:
     logger.info(f"loading checkpoint: {hue.b}{checkpoint_path.name}{hue.q}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     scalers = restore_scalers(checkpoint)
+    boundary_condition = scalers.get("boundary_condition")
+    if boundary_condition is not None:
+        logger.info(
+            f"boundary condition restored: "
+            f"{hue.m}{int(boundary_condition.wall_mask.sum())}{hue.q} wall nodes"
+        )
 
     _, _, test_data = build_case_datasets(args)
     test_dataset = ScaledFlowDataset(test_data, scalers["feature_scaler"], scalers["coord_scaler"])
@@ -471,6 +496,7 @@ def inference_pipeline(args: argparse.Namespace) -> None:
                 steps=steps,
                 start_t_norm=start_t_norm,
                 dt_norm=dt_norm,
+                boundary_condition=boundary_condition,
             )
 
             pred_seq = scalers["feature_scaler"].inverse_transform(pred_seq_std).cpu().squeeze(0)
@@ -553,6 +579,15 @@ def probe_pipeline(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     train_data, _, _ = build_case_datasets(args)
     scalers = fit_scalers(train_data)
+    boundary_condition = None
+    if args.use_hard_bc:
+        boundary_condition = BoundaryCondition().fit(
+            train_data,
+            scalers["feature_scaler"],
+            velocity_channels=list(range(args.spatial_dim)),
+            velocity_threshold=args.velocity_threshold,
+        )
+        scalers["boundary_condition"] = boundary_condition
     FlowData.augment_windows(train_data, args.win_len, args.train_win_stride)
 
     probe_dataset = ScaledFlowDataset(train_data, scalers["feature_scaler"], scalers["coord_scaler"])
@@ -570,7 +605,8 @@ def probe_pipeline(args: argparse.Namespace) -> None:
 
     model = build_model(args)
     num_params = sum(parameter.numel() for parameter in model.parameters())
-    trainer = build_trainer(args, model, scalers={}, output_dir=Path(args.output_dir))
+    trainer = build_trainer(args, model, scalers=scalers, output_dir=Path(args.output_dir),
+        boundary_condition=boundary_condition)
 
     rollout_steps = min(args.probe_rollout_steps, seq_std.shape[1] - 1)
     trainer.model.train()
@@ -587,20 +623,15 @@ def probe_pipeline(args: argparse.Namespace) -> None:
     )
 
     torch.cuda.reset_peak_memory_stats(device)
-    with torch.amp.autocast(device_type=device.type, enabled=trainer.use_amp):
-        loss = trainer.compute_rollout_loss(
-            batch=batch,
-            rollout_steps=rollout_steps,
-            teacher_forcing_ratio=0.0,
-            noise_std=0.0,
-        )
+    loss = trainer.compute_rollout_loss(
+        batch=batch,
+        rollout_steps=rollout_steps,
+        teacher_forcing_ratio=0.0,
+        noise_std=0.0,
+    )
 
-    trainer.grad_scaler.scale(loss).backward()
-    if trainer.grad_clip > 0.0:
-        trainer.grad_scaler.unscale_(trainer.optimizer)
-        torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.grad_clip)
-    trainer.grad_scaler.step(trainer.optimizer)
-    trainer.grad_scaler.update()
+    loss.backward()
+    trainer.optimizer.step()
 
     peak = torch.cuda.max_memory_allocated(device)
     total = torch.cuda.get_device_properties(device).total_memory
@@ -622,9 +653,9 @@ def probe_pipeline(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     args = config.get_args()
     pipeline_map = {
+        "probe": probe_pipeline,
         "train": train_pipeline,
         "infer": inference_pipeline,
-        "probe": probe_pipeline,
     }
 
     for mode in args.mode:

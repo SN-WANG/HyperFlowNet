@@ -141,6 +141,7 @@ def get_args() -> argparse.Namespace:
         use_spatial_encoding=True,
         use_temporal_encoding=True,
         predict_delta=True,
+        use_hard_bc=True,
     )
     model.add_argument(
         "--disable_spatial_encoding", action="store_false", dest="use_spatial_encoding",
@@ -153,6 +154,14 @@ def get_args() -> argparse.Namespace:
     model.add_argument(
         "--disable_delta_prediction", action="store_false", dest="predict_delta",
         help="Predict the next state directly instead of residual updates."
+    )
+    model.add_argument(
+        "--disable_hard_bc", action="store_false", dest="use_hard_bc",
+        help="Disable hard boundary-condition enforcement during rollout."
+    )
+    model.add_argument(
+        "--velocity_threshold", type=float, default=1e-4,
+        help="Velocity magnitude threshold used for wall-node detection."
     )
 
     # ============================================================
@@ -175,15 +184,6 @@ def get_args() -> argparse.Namespace:
     optim.add_argument(
         "--patience", type=int, default=120,
         help="Early stopping patience."
-    )
-    optim.add_argument(
-        "--grad_clip", type=float, default=0.5,
-        help="Gradient clipping threshold."
-    )
-    optim.set_defaults(use_amp=True)
-    optim.add_argument(
-        "--disable_amp", action="store_false", dest="use_amp",
-        help="Disable mixed-precision training."
     )
 
     # ============================================================

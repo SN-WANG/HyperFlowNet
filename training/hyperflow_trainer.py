@@ -56,6 +56,8 @@ class HyperFlowCriterion(nn.Module):
         Returns:
             Tensor: Reduced NMSE loss. ().
         """
+        pred = pred.float()
+        target = target.float()
         C = pred.shape[-1]
         sq_err = (pred - target).square().reshape(-1, C).sum(dim=0)
         sq_ref = target.square().reshape(-1, C).sum(dim=0).clamp_min(self.eps)
@@ -131,8 +133,6 @@ class HyperFlowTrainer(BaseTrainer):
         max_epochs: int = 480,
         patience: Optional[int] = None,
         weight_decay: float = 1e-5,
-        grad_clip: float = 0.5,
-        use_amp: bool = True,
         rollout_steps: Sequence[int] = (1, 2, 4, 8, 12),
         stage_ratios: Sequence[float] = (0.15, 0.20, 0.25, 0.20, 0.20),
         teacher_forcing_lows: Sequence[float] = (1.0, 0.9, 0.75, 0.4, 0.0),
@@ -146,6 +146,7 @@ class HyperFlowTrainer(BaseTrainer):
         delta_loss_weight: float = 0.0,
         step_weight_power: float = 1.0,
         loss_eps: float = 1e-6,
+        boundary_condition: Optional[Any] = None,
         optimizer: Optional[Optimizer] = None,
         criterion: Optional[nn.Module] = None,
         **kwargs,
@@ -159,8 +160,6 @@ class HyperFlowTrainer(BaseTrainer):
             max_epochs (int): Maximum number of epochs.
             patience (Optional[int]): Early stopping patience.
             weight_decay (float): AdamW weight decay.
-            grad_clip (float): Gradient clipping threshold.
-            use_amp (bool): Whether to enable mixed-precision training on CUDA.
             rollout_steps (Sequence[int]): Rollout length of each curriculum stage.
             stage_ratios (Sequence[float]): Epoch ratio of each curriculum stage.
             teacher_forcing_lows (Sequence[float]): Final teacher-forcing ratio of each stage.
@@ -174,6 +173,7 @@ class HyperFlowTrainer(BaseTrainer):
             delta_loss_weight (float): Auxiliary delta loss weight.
             step_weight_power (float): Power used for rollout-step weighting.
             loss_eps (float): Small constant used in NMSE normalization.
+            boundary_condition (Optional[Any]): Optional hard boundary-condition enforcer.
             optimizer (Optional[Optimizer]): External optimizer override.
             criterion (Optional[nn.Module]): External criterion override.
             **kwargs: Arguments forwarded to BaseTrainer.
@@ -199,10 +199,6 @@ class HyperFlowTrainer(BaseTrainer):
             **kwargs,
         )
 
-        self.grad_clip = grad_clip
-        self.use_amp = use_amp and self.device.type == "cuda"
-        self.grad_scaler = torch.amp.GradScaler(device=self.device.type, enabled=self.use_amp)
-
         self.rollout_steps = list(rollout_steps)
         self.stage_ratios = list(stage_ratios)
         self.teacher_forcing_lows = list(teacher_forcing_lows)
@@ -213,6 +209,7 @@ class HyperFlowTrainer(BaseTrainer):
         self.input_noise_std = input_noise_std
         self.input_noise_decay = input_noise_decay
         self.eval_rollout_steps = eval_rollout_steps
+        self.boundary_condition = boundary_condition
 
         self.stages = self._build_stages()
         self._active_stage_idx = -1
@@ -431,6 +428,7 @@ class HyperFlowTrainer(BaseTrainer):
             targets=target_seq,
             teacher_forcing_ratio=teacher_forcing_ratio,
             noise_std=noise_std,
+            boundary_condition=self.boundary_condition,
         )
         return self.criterion(pred_seq, target_seq, input_state)
 
@@ -483,18 +481,11 @@ class HyperFlowTrainer(BaseTrainer):
                 if is_training:
                     self.optimizer.zero_grad(set_to_none=True)
 
-                with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
-                    loss = self._compute_loss(batch)
+                loss = self._compute_loss(batch)
 
                 if is_training:
-                    self.grad_scaler.scale(loss).backward()
-
-                    if self.grad_clip > 0.0:
-                        self.grad_scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-
-                    self.grad_scaler.step(self.optimizer)
-                    self.grad_scaler.update()
+                    loss.backward()
+                    self.optimizer.step()
 
                 loss_val = float(loss.detach().item())
                 losses.append(loss_val)
@@ -516,7 +507,6 @@ class HyperFlowTrainer(BaseTrainer):
             extra_state (Optional[Dict]): Optional additional state.
         """
         state = {
-            "grad_scaler_state_dict": self.grad_scaler.state_dict(),
             "curriculum_stages": self.stages,
             "eval_rollout_steps": self.eval_rollout_steps,
         }
