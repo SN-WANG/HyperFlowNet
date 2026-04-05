@@ -6,70 +6,21 @@ import json
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import numpy as np
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 import config
 
-from data.flow_data import FlowData
 from data.boundary import BoundaryCondition
-from data.flow_plot import (
-    plot_error_heatmap,
-    plot_metrics_comparison,
-    plot_rollout_error,
-    plot_training_curves,
-)
+from data.flow_data import FlowData
+from data.flow_plot import plot_error_heatmap, plot_metrics_comparison, plot_rollout_error, plot_training_curves
 from data.flow_vis import FlowVis
 from models.hflownet import HyperFlowNet
 from training.hyperflow_trainer import HyperFlowTrainer
 from utils.hue_logger import hue, logger
 from utils.scaler import MinMaxScalerTensor, StandardScalerTensor
 from utils.seeder import seed_everything
-
-
-class ScaledFlowDataset(Dataset):
-    """
-    Dataset wrapper that applies feature and coordinate scaling on demand.
-    """
-
-    def __init__(
-        self,
-        dataset: FlowData,
-        feature_scaler: StandardScalerTensor,
-        coord_scaler: MinMaxScalerTensor,
-    ) -> None:
-        """
-        Initialize the scaled dataset wrapper.
-
-        Args:
-            dataset (FlowData): Raw flow dataset.
-            feature_scaler (StandardScalerTensor): Fitted feature scaler.
-            coord_scaler (MinMaxScalerTensor): Fitted coordinate scaler.
-        """
-        self.dataset = dataset
-        self.feature_scaler = feature_scaler
-        self.coord_scaler = coord_scaler
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, float, float]:
-        """
-        Load and scale one rollout sample.
-
-        Args:
-            idx (int): Sample index.
-
-        Returns:
-            Tuple[Tensor, Tensor, float, float]: Scaled sequence, scaled coordinates,
-                normalized start time, and normalized time increment.
-        """
-        seq, coords, start_t_norm, dt_norm = self.dataset[idx]
-        seq_std = self.feature_scaler.transform(seq)
-        coords_norm = self.coord_scaler.transform(coords)
-        return seq_std, coords_norm, start_t_norm, dt_norm
 
 
 class Metrics:
@@ -158,132 +109,39 @@ class Metrics:
         return results
 
 
-def build_case_datasets(args: argparse.Namespace) -> Tuple[FlowData, FlowData, FlowData]:
-    """
-    Build train, validation, and test datasets before window augmentation.
-
-    Args:
-        args (argparse.Namespace): Parsed configuration.
-
-    Returns:
-        Tuple[FlowData, FlowData, FlowData]: Raw train, validation, and test datasets.
-    """
-    all_cases = FlowData.discover_cases(args.data_dir)
-
-    rng = np.random.default_rng(seed=args.seed)
-    rng.shuffle(all_cases)
-
-    num_train = len(all_cases) - args.val_cases - args.test_cases
-    splits = {
-        "train": all_cases[:num_train],
-        "val": all_cases[num_train:num_train + args.val_cases],
-        "test": all_cases[num_train + args.val_cases:],
-    }
-
-    logger.info(
-        f"dataset split | train: {hue.m}{len(splits['train'])}{hue.q}, "
-        f"val: {hue.m}{len(splits['val'])}{hue.q}, "
-        f"test: {hue.m}{len(splits['test'])}{hue.q}"
-    )
-
-    train_data = FlowData(args.data_dir, splits["train"], spatial_dim=args.spatial_dim)
-    val_data = FlowData(args.data_dir, splits["val"], spatial_dim=args.spatial_dim)
-    test_data = FlowData(args.data_dir, splits["test"], spatial_dim=args.spatial_dim)
-    return train_data, val_data, test_data
-
-
-def fit_scalers(train_data: FlowData) -> Dict[str, object]:
-    """
-    Fit feature and coordinate scalers on raw training cases.
-
-    Args:
-        train_data (FlowData): Raw training dataset.
-
-    Returns:
-        Dict[str, object]: Dictionary containing fitted scalers.
-    """
-    train_seqs = torch.cat(train_data.seqs, dim=0)
-    train_coords = torch.cat(train_data.coords, dim=0)
-
-    feature_scaler = StandardScalerTensor().fit(train_seqs, channel_dim=-1)
-    coord_scaler = MinMaxScalerTensor(norm_range="bipolar").fit(train_coords, channel_dim=-1)
-    return {
-        "feature_scaler": feature_scaler,
-        "coord_scaler": coord_scaler,
-    }
-
-
-def build_loaders(
-    args: argparse.Namespace,
-    train_data: FlowData,
-    val_data: FlowData,
-    scalers: Dict[str, object],
-) -> Tuple[DataLoader, DataLoader]:
-    """
-    Build scaled training and validation loaders.
-
-    Args:
-        args (argparse.Namespace): Parsed configuration.
-        train_data (FlowData): Augmented training dataset.
-        val_data (FlowData): Augmented validation dataset.
-        scalers (Dict[str, object]): Fitted feature and coordinate scalers.
-
-    Returns:
-        Tuple[DataLoader, DataLoader]: Training and validation data loaders.
-    """
-    train_dataset = ScaledFlowDataset(train_data, scalers["feature_scaler"], scalers["coord_scaler"])
-    val_dataset = ScaledFlowDataset(val_data, scalers["feature_scaler"], scalers["coord_scaler"])
-
-    pin_memory = torch.cuda.is_available()
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-    )
-    return train_loader, val_loader
-
-
-def build_model(args: argparse.Namespace) -> HyperFlowNet:
+def _build_model(args: argparse.Namespace) -> HyperFlowNet:
     """
     Instantiate HyperFlowNet from the parsed configuration.
 
     Args:
-        args (argparse.Namespace): Parsed configuration.
+        args (argparse.Namespace): Parsed command-line arguments.
 
     Returns:
         HyperFlowNet: Initialized model.
     """
     num_channels = len(args.channel_names)
+    coord_features = max(args.coord_features, 0)
+    num_fixed_bands = max(args.num_fixed_bands, 0)
+
     return HyperFlowNet(
         in_channels=num_channels,
         out_channels=num_channels,
         spatial_dim=args.spatial_dim,
         width=args.width,
         depth=args.depth,
-        num_heads=args.num_heads,
         num_slices=args.num_slices,
-        ffn_ratio=args.ffn_ratio,
+        num_heads=args.num_heads,
         use_spatial_encoding=args.use_spatial_encoding,
         use_temporal_encoding=args.use_temporal_encoding,
-        num_fixed_bands=args.num_fixed_bands,
-        num_learned_features=args.num_learned_features,
+        num_fixed_bands=num_fixed_bands,
+        num_learned_features=coord_features,
         time_features=args.time_features,
         freq_base=args.freq_base,
-        predict_delta=args.predict_delta,
-        delta_scale=args.delta_scale,
+        predict_delta=False,
     )
 
 
-def build_trainer(
+def _build_trainer(
     args: argparse.Namespace,
     model: HyperFlowNet,
     scalers: Dict[str, object],
@@ -291,247 +149,320 @@ def build_trainer(
     boundary_condition: BoundaryCondition | None = None,
 ) -> HyperFlowTrainer:
     """
-    Build the HyperFlowNet trainer.
+    Instantiate the HyperFlowNet trainer.
 
     Args:
-        args (argparse.Namespace): Parsed configuration.
+        args (argparse.Namespace): Parsed command-line arguments.
         model (HyperFlowNet): HyperFlowNet model.
-        scalers (Dict[str, object]): Fitted scalers to be stored in checkpoints.
-        output_dir (Path): Output directory.
-        boundary_condition (BoundaryCondition | None): Optional hard boundary-condition enforcer.
+        scalers (Dict[str, object]): Dictionary of data scalers for checkpoint saving.
+        output_dir (Path): Directory for saving artifacts.
+        boundary_condition (BoundaryCondition | None): Optional boundary-condition enforcer.
 
     Returns:
-        HyperFlowTrainer: Initialized trainer.
+        HyperFlowTrainer: Configured trainer.
     """
     return HyperFlowTrainer(
         model=model,
         lr=args.lr,
         max_epochs=args.max_epochs,
-        patience=args.patience,
         weight_decay=args.weight_decay,
-        rollout_steps=args.rollout_steps,
-        stage_ratios=args.stage_ratios,
-        teacher_forcing_lows=args.teacher_forcing_lows,
-        stage_lrs=args.stage_lrs,
-        stage_warmup_ratio=args.stage_warmup_ratio,
-        stage_min_lr_ratio=args.stage_min_lr_ratio,
-        input_noise_std=args.input_noise_std,
-        input_noise_decay=args.input_noise_decay,
-        eval_rollout_steps=args.eval_rollout_steps,
-        channel_weights=args.channel_weights,
-        delta_loss_weight=args.delta_loss_weight,
-        step_weight_power=args.step_weight_power,
-        loss_eps=args.loss_eps,
+        eta_min=args.eta_min,
+        max_rollout_steps=args.max_rollout_steps,
+        rollout_patience=args.rollout_patience,
+        noise_std_init=args.noise_std_init,
+        noise_decay=args.noise_decay,
         boundary_condition=boundary_condition,
+        channel_weights=args.channel_weights,
         scalers=scalers,
         output_dir=output_dir,
         device=args.device,
     )
 
 
-def save_run_config(args: argparse.Namespace, output_dir: Path, num_params: int) -> None:
+def data_pipeline(
+    args: argparse.Namespace,
+) -> Tuple[DataLoader, DataLoader, DataLoader, FlowData, Dict[str, object], BoundaryCondition | None]:
     """
-    Save the current run configuration.
+    Build datasets and training-time data utilities once for all pipelines.
 
     Args:
-        args (argparse.Namespace): Parsed configuration.
-        output_dir (Path): Output directory.
-        num_params (int): Number of model parameters.
-    """
-    payload = vars(args).copy()
-    payload["num_params"] = num_params
-    with open(output_dir / "config.json", "w") as file:
-        json.dump(payload, file, indent=2)
-
-
-def resolve_checkpoint_path(args: argparse.Namespace) -> Path:
-    """
-    Resolve the checkpoint path used during inference.
-
-    Args:
-        args (argparse.Namespace): Parsed configuration.
+        args (argparse.Namespace): Parsed command-line arguments.
 
     Returns:
-        Path: Checkpoint path.
+        Tuple[DataLoader, DataLoader, DataLoader, FlowData, Dict[str, object], BoundaryCondition | None]:
+            Train, validation, and test loaders together with the raw test dataset,
+            fitted scalers, and optional boundary condition.
     """
-    output_dir = Path(args.output_dir)
-    checkpoint_path = output_dir / args.checkpoint_name
+    logger.info("initializing datasets...")
+    train_data, val_data, test_data = FlowData.spawn(
+        data_dir=args.data_dir,
+        spatial_dim=args.spatial_dim,
+        win_len=args.win_len,
+        win_stride=args.win_stride,
+    )
 
-    if checkpoint_path.exists():
-        return checkpoint_path
-
-    fallback_path = output_dir / "ckpt.pt"
-    if fallback_path.exists():
-        return fallback_path
-
-    raise FileNotFoundError(f"checkpoint not found under {output_dir}")
-
-
-def restore_scalers(checkpoint: Dict[str, object]) -> Dict[str, object]:
-    """
-    Restore feature and coordinate scalers from a checkpoint.
-
-    Args:
-        checkpoint (Dict[str, object]): Loaded checkpoint payload.
-
-    Returns:
-        Dict[str, object]: Restored scalers and optional boundary condition.
-    """
-    feature_scaler = StandardScalerTensor()
-    feature_scaler.load_state_dict(checkpoint["scaler_state_dict"]["feature_scaler"])
-
-    coord_scaler = MinMaxScalerTensor(norm_range="bipolar")
-    coord_scaler.load_state_dict(checkpoint["scaler_state_dict"]["coord_scaler"])
-
-    scalers = {
+    train_seqs = torch.cat(train_data.seqs, dim=0)
+    train_coords = torch.cat(train_data.coords, dim=0)
+    feature_scaler = StandardScalerTensor().fit(train_seqs, channel_dim=-1)
+    coord_scaler = MinMaxScalerTensor(norm_range="bipolar").fit(train_coords, channel_dim=-1)
+    scalers: Dict[str, object] = {
         "feature_scaler": feature_scaler,
         "coord_scaler": coord_scaler,
     }
-    boundary_state = checkpoint["scaler_state_dict"].get("boundary_condition")
-    if boundary_state is not None:
-        boundary_condition = BoundaryCondition()
-        boundary_condition.load_state_dict(boundary_state)
-        scalers["boundary_condition"] = boundary_condition
 
-    return scalers
-
-
-def train_pipeline(args: argparse.Namespace) -> None:
-    """
-    Execute the training workflow.
-
-    Args:
-        args (argparse.Namespace): Parsed configuration.
-    """
-    seed_everything(args.seed)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("loading datasets...")
-    train_data, val_data, _ = build_case_datasets(args)
-    scalers = fit_scalers(train_data)
     boundary_condition = None
-
     if args.use_hard_bc:
-        boundary_condition = BoundaryCondition().fit(
+        boundary_condition = BoundaryCondition()
+        boundary_condition.fit(
             train_data,
-            scalers["feature_scaler"],
+            feature_scaler,
             velocity_channels=list(range(args.spatial_dim)),
             velocity_threshold=args.velocity_threshold,
         )
         scalers["boundary_condition"] = boundary_condition
 
-    logger.info("building training windows...")
-    FlowData.augment_windows(train_data, args.win_len, args.train_win_stride)
-    FlowData.augment_windows(val_data, args.win_len, args.val_win_stride)
+    processed_splits = []
+    for dataset in (train_data, val_data, test_data):
+        samples = []
+        for seq, coord, start_t_norm, dt_norm in dataset:
+            seq_std = feature_scaler.transform(seq)
+            coords_norm = coord_scaler.transform(coord)
+            start_t_norm = torch.tensor(start_t_norm, dtype=seq_std.dtype)
+            dt_norm = torch.tensor(dt_norm, dtype=seq_std.dtype)
+            samples.append((seq_std, coords_norm, start_t_norm, dt_norm))
+        processed_splits.append(samples)
 
-    train_loader, val_loader = build_loaders(args, train_data, val_data, scalers)
+    train_samples, val_samples, test_samples = processed_splits
+    pin_memory = torch.cuda.is_available()
 
-    model = build_model(args)
-    num_params = sum(parameter.numel() for parameter in model.parameters())
-    logger.info(f"model parameters: {hue.m}{num_params}{hue.q}")
-    save_run_config(args, output_dir, num_params)
+    train_loader = DataLoader(
+        train_samples,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_samples,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+    )
+    test_loader = DataLoader(
+        test_samples,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+    )
 
-    trainer = build_trainer(args, model, scalers, output_dir, boundary_condition=boundary_condition)
-    trainer.fit(train_loader, val_loader)
-
-    history_path = output_dir / "history.json"
-    if history_path.exists():
-        plot_training_curves(
-            history_paths={"HyperFlowNet": str(history_path)},
-            output_path=str(output_dir / "training_curve.png"),
-        )
+    return train_loader, val_loader, test_loader, test_data, scalers, boundary_condition
 
 
-def inference_pipeline(args: argparse.Namespace) -> None:
+def probe_pipeline(
+    args: argparse.Namespace,
+    train_loader: DataLoader,
+    boundary_condition: BoundaryCondition | None,
+) -> None:
     """
-    Execute the inference workflow.
+    Run one full-rollout step to estimate peak GPU memory usage.
 
     Args:
-        args (argparse.Namespace): Parsed configuration.
+        args (argparse.Namespace): Parsed command-line arguments.
+        train_loader (DataLoader): Training data loader.
+        boundary_condition (BoundaryCondition | None): Optional boundary-condition enforcer.
     """
-    seed_everything(args.seed)
-    output_dir = Path(args.output_dir)
-    checkpoint_path = resolve_checkpoint_path(args)
     device = torch.device(args.device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        logger.warning("No CUDA device - probe skipped.")
+        return
 
-    logger.info(f"loading checkpoint: {hue.b}{checkpoint_path.name}{hue.q}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    scalers = restore_scalers(checkpoint)
-    boundary_condition = scalers.get("boundary_condition")
+    seq_std, coords_norm, start_t_norm, dt_norm = next(iter(train_loader))
+    seq_std = seq_std.to(device)
+    coords_norm = coords_norm.to(device)
+    start_t_norm = start_t_norm.to(device)
+    dt_norm = dt_norm.to(device)
+
+    output_dir = Path(args.output_dir)
+    model = _build_model(args)
+    trainer = _build_trainer(args, model, scalers={}, output_dir=output_dir, boundary_condition=boundary_condition)
+    trainer.model.train()
+    trainer.optimizer.zero_grad(set_to_none=True)
+
+    B, T, N, C = seq_std.shape
+    k = min(args.max_rollout_steps, T - 1)
+    num_params = sum(p.numel() for p in trainer.model.parameters())
+
+    logger.info(
+        f"{hue.y}probe config:{hue.q} "
+        f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, "
+        f"nodes={hue.m}{N}{hue.q}, channels={hue.m}{C}{hue.q}, "
+        f"max_rollout={hue.m}{k}{hue.q}, params={hue.m}{num_params}{hue.q}"
+    )
+
+    torch.cuda.reset_peak_memory_stats(device)
+
+    input_state = seq_std[:, 0]
+    target_seq = seq_std[:, 1:k + 1]
+    pred_seq = trainer.model(
+        inputs=input_state,
+        coords=coords_norm,
+        t_norm=start_t_norm,
+        dt_norm=dt_norm,
+        targets=target_seq,
+        teacher_forcing_ratio=0.0,
+        noise_std=0.0,
+        boundary_condition=boundary_condition,
+    )
+    loss = trainer.criterion(pred_seq, target_seq)
+    loss.backward()
+    trainer.optimizer.step()
+
+    peak = torch.cuda.max_memory_allocated(device)
+    total = torch.cuda.get_device_properties(device).total_memory
+    pct = 100.0 * peak / total
+
+    if pct < 75.0:
+        status = f"{hue.g}SAFE{hue.q}"
+    elif pct < 92.0:
+        status = f"{hue.y}WARNING - close to limit{hue.q}"
+    else:
+        status = f"{hue.r}CRITICAL - likely OOM in real training{hue.q}"
+
+    logger.info(f"{hue.y}device: {hue.b}{torch.cuda.get_device_name(device)}{hue.q} ({hue.m}{total / 1e9:.1f}{hue.q} GB)")
+    logger.info(f"peak usage: {hue.m}{peak / 1e9:.2f}{hue.q} GB ({hue.m}{pct:.1f}{hue.q} %) -> {status}")
+    logger.info(f"{hue.g}probe completed.{hue.q}")
+
+
+def train_pipeline(
+    args: argparse.Namespace,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    scalers: Dict[str, object],
+    boundary_condition: BoundaryCondition | None,
+) -> None:
+    """
+    Execute the training workflow.
+
+    Args:
+        args (argparse.Namespace): Parsed command-line arguments.
+        train_loader (DataLoader): Training data loader.
+        val_loader (DataLoader): Validation data loader.
+        scalers (Dict[str, object]): Fitted feature and coordinate scalers.
+        boundary_condition (BoundaryCondition | None): Optional boundary-condition enforcer.
+    """
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model = _build_model(args)
+    num_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"model has {hue.m}{num_params}{hue.q} parameters")
+
+    trainer = _build_trainer(args, model, scalers, output_dir, boundary_condition=boundary_condition)
+    trainer.fit(train_loader, val_loader)
+
+
+def inference_pipeline(
+    args: argparse.Namespace,
+    test_loader: DataLoader,
+    test_data: FlowData,
+) -> None:
+    """
+    Execute the inference workflow using the saved training artifacts.
+
+    Args:
+        args (argparse.Namespace): Parsed command-line arguments.
+        test_loader (DataLoader): Test data loader from the shared data pipeline.
+        test_data (FlowData): Raw test dataset from the shared data pipeline.
+    """
+    device = torch.device(args.device)
+    run_dir = Path(args.output_dir)
+    model_path = run_dir / "ckpt.pt"
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"ckpt.pt not found at {model_path}.")
+
+    logger.info("loading training artifacts...")
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    scaler_state = checkpoint["scaler_state_dict"]
+
+    feature_scaler = StandardScalerTensor()
+    feature_scaler.load_state_dict(scaler_state["feature_scaler"])
+
+    coord_scaler = MinMaxScalerTensor(norm_range="bipolar")
+    coord_scaler.load_state_dict(scaler_state["coord_scaler"])
+
+    boundary_condition = None
+    if "boundary_condition" in scaler_state:
+        boundary_condition = BoundaryCondition()
+        boundary_condition.load_state_dict(scaler_state["boundary_condition"])
+
     if boundary_condition is not None:
-        logger.info(
-            f"boundary condition restored: "
-            f"{hue.m}{int(boundary_condition.wall_mask.sum())}{hue.q} wall nodes"
-        )
+        logger.info(f"boundary condition restored: {hue.m}{int(boundary_condition.wall_mask.sum())}{hue.q} wall nodes")
 
-    _, _, test_data = build_case_datasets(args)
-    test_dataset = ScaledFlowDataset(test_data, scalers["feature_scaler"], scalers["coord_scaler"])
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    model = _build_model(args)
+    num_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"model has {hue.m}{num_params}{hue.q} parameters")
 
-    model = build_model(args)
     model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device).eval()
+    model.to(device)
+    model.eval()
 
-    num_params = sum(parameter.numel() for parameter in model.parameters())
-    logger.info(f"model parameters: {hue.m}{num_params}{hue.q}")
-
-    metrics_evaluator = Metrics(args.channel_names)
-    visualizer = FlowVis(output_dir=output_dir, spatial_dim=args.spatial_dim)
+    logger.info(f"{hue.g}running inference on test set...{hue.q}")
+    visualizer = FlowVis(output_dir=run_dir, spatial_dim=args.spatial_dim)
+    metrics_evaluator = Metrics(channel_names=args.channel_names)
 
     case_metrics: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
 
     with torch.no_grad():
-        for idx, (seq_std, coords_norm, start_t_norm, dt_norm) in enumerate(test_loader):
+        for i, (seq_std, coords_norm, start_t_norm, dt_norm) in enumerate(test_loader):
             seq_std = seq_std.to(device)
             coords_norm = coords_norm.to(device)
             start_t_norm = start_t_norm.to(device)
             dt_norm = dt_norm.to(device)
 
+            case_name = test_data.case_names[i]
             steps = seq_std.shape[1] - 1
             initial_state = seq_std[:, 0]
+            coords_raw = test_data.coords[i].cpu()
+
             pred_seq_std = model.predict(
-                inputs=initial_state,
-                coords=coords_norm,
-                steps=steps,
+                initial_state,
+                coords_norm,
+                steps,
                 start_t_norm=start_t_norm,
                 dt_norm=dt_norm,
                 boundary_condition=boundary_condition,
             )
 
-            pred_seq = scalers["feature_scaler"].inverse_transform(pred_seq_std).cpu().squeeze(0)
-            gt_seq = scalers["feature_scaler"].inverse_transform(seq_std).cpu().squeeze(0)
-            coords_raw = test_data.coords[idx].cpu()
-            case_name = test_data.case_names[idx]
+            pred_seq = feature_scaler.inverse_transform(pred_seq_std).cpu().squeeze(0)
+            gt_seq = feature_scaler.inverse_transform(seq_std).cpu().squeeze(0)
 
             metrics = metrics_evaluator.compute(pred_seq, gt_seq)
             case_metrics[case_name] = metrics
 
-            log_items = []
+            log_metrics = []
             for ch_name in args.channel_names:
                 nmse = metrics[ch_name]["global"]["nmse"]
                 r2 = metrics[ch_name]["global"]["r2"]
                 accuracy = metrics[ch_name]["global"]["accuracy"]
-                log_items.append(
-                    f"{hue.c}{ch_name}{hue.q}: NMSE={hue.m}{nmse:.2e}{hue.q}, "
+                log_metrics.append(
+                    f"{hue.c}{ch_name}:{hue.q} NMSE={hue.m}{nmse:.2e}{hue.q}, "
                     f"R2={hue.m}{r2:.4f}{hue.q}, ACC={hue.m}{accuracy:.2f}%{hue.q}"
                 )
-            logger.info(f"case {hue.b}{case_name}{hue.q} | " + " | ".join(log_items))
 
-            torch.save(pred_seq, output_dir / f"{case_name}_pred.pt")
+            logger.info(f"case {hue.b}{case_name}{hue.q} | " + " | ".join(log_metrics))
 
-            visualizer.animate_comparison(
-                gt=gt_seq,
-                pred=pred_seq,
-                coords=coords_raw,
-                case_name=case_name,
-            )
+            torch.save(pred_seq, run_dir / f"{case_name}_pred.pt")
+
+            visualizer.animate_comparison(gt=gt_seq, pred=pred_seq, coords=coords_raw, case_name=case_name)
 
             plot_rollout_error(
                 pred=pred_seq,
                 gt=gt_seq,
                 channel_names=args.channel_names,
-                output_path=str(output_dir / f"{case_name}_rollout_error.png"),
+                output_path=str(run_dir / f"{case_name}_rollout_error.png"),
             )
 
             num_steps = pred_seq.shape[0]
@@ -542,121 +473,37 @@ def inference_pipeline(args: argparse.Namespace) -> None:
                     coords=coords_raw,
                     timestep=step_idx,
                     channel_names=args.channel_names,
-                    output_path=str(output_dir / f"{case_name}_error_t{step_idx}_{step_name}.png"),
+                    output_path=str(run_dir / f"{case_name}_error_t{step_idx}_{step_name}.png"),
                 )
 
-    with open(output_dir / "test_metrics.json", "w") as file:
-        json.dump(case_metrics, file, indent=2)
+    with open(run_dir / "test_metrics.json", "w") as f:
+        json.dump(case_metrics, f, indent=4)
 
-    history_path = output_dir / "history.json"
+    history_path = run_dir / "history.json"
     if history_path.exists():
         plot_training_curves(
             history_paths={"HyperFlowNet": str(history_path)},
-            output_path=str(output_dir / "training_curve.png"),
+            output_path=str(run_dir / "training_curve.png"),
         )
 
     plot_metrics_comparison(
-        metrics_paths={"HyperFlowNet": str(output_dir / "test_metrics.json")},
-        output_path=str(output_dir / "metrics_comparison.png"),
+        metrics_paths={"HyperFlowNet": str(run_dir / "test_metrics.json")},
+        output_path=str(run_dir / "metrics_comparison.png"),
         channel_names=args.channel_names,
     )
 
-    logger.info(f"{hue.g}inference finished.{hue.q}")
-
-
-def probe_pipeline(args: argparse.Namespace) -> None:
-    """
-    Execute one training-like step to estimate peak GPU memory.
-
-    Args:
-        args (argparse.Namespace): Parsed configuration.
-    """
-    device = torch.device(args.device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        logger.warning("CUDA is unavailable, probe skipped.")
-        return
-
-    seed_everything(args.seed)
-    train_data, _, _ = build_case_datasets(args)
-    scalers = fit_scalers(train_data)
-    boundary_condition = None
-    if args.use_hard_bc:
-        boundary_condition = BoundaryCondition().fit(
-            train_data,
-            scalers["feature_scaler"],
-            velocity_channels=list(range(args.spatial_dim)),
-            velocity_threshold=args.velocity_threshold,
-        )
-        scalers["boundary_condition"] = boundary_condition
-    FlowData.augment_windows(train_data, args.win_len, args.train_win_stride)
-
-    probe_dataset = ScaledFlowDataset(train_data, scalers["feature_scaler"], scalers["coord_scaler"])
-    probe_loader = DataLoader(
-        probe_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-
-    batch = next(iter(probe_loader))
-    batch = [item.to(device) if isinstance(item, Tensor) else item for item in batch]
-    seq_std, coords_norm, _, _ = batch
-
-    model = build_model(args)
-    num_params = sum(parameter.numel() for parameter in model.parameters())
-    trainer = build_trainer(args, model, scalers=scalers, output_dir=Path(args.output_dir),
-        boundary_condition=boundary_condition)
-
-    rollout_steps = min(args.probe_rollout_steps, seq_std.shape[1] - 1)
-    trainer.model.train()
-    trainer.optimizer.zero_grad(set_to_none=True)
-
-    logger.info(
-        f"{hue.y}probe config:{hue.q} "
-        f"batch={hue.m}{seq_std.shape[0]}{hue.q}, "
-        f"frames={hue.m}{seq_std.shape[1]}{hue.q}, "
-        f"nodes={hue.m}{seq_std.shape[2]}{hue.q}, "
-        f"channels={hue.m}{seq_std.shape[3]}{hue.q}, "
-        f"rollout={hue.m}{rollout_steps}{hue.q}, "
-        f"params={hue.m}{num_params}{hue.q}"
-    )
-
-    torch.cuda.reset_peak_memory_stats(device)
-    loss = trainer.compute_rollout_loss(
-        batch=batch,
-        rollout_steps=rollout_steps,
-        teacher_forcing_ratio=0.0,
-        noise_std=0.0,
-    )
-
-    loss.backward()
-    trainer.optimizer.step()
-
-    peak = torch.cuda.max_memory_allocated(device)
-    total = torch.cuda.get_device_properties(device).total_memory
-    ratio = 100.0 * peak / total
-
-    if ratio < 75.0:
-        status = f"{hue.g}SAFE{hue.q}"
-    elif ratio < 92.0:
-        status = f"{hue.y}WARNING{hue.q}"
-    else:
-        status = f"{hue.r}CRITICAL{hue.q}"
-
-    logger.info(
-        f"peak usage: {hue.m}{peak / 1e9:.2f}{hue.q} GB / {hue.m}{total / 1e9:.2f}{hue.q} GB "
-        f"({hue.m}{ratio:.1f}%{hue.q}) -> {status}"
-    )
+    logger.info(f"{hue.g}inference completed.{hue.q}")
 
 
 if __name__ == "__main__":
     args = config.get_args()
-    pipeline_map = {
-        "probe": probe_pipeline,
-        "train": train_pipeline,
-        "infer": inference_pipeline,
-    }
+    seed_everything(args.seed)
 
-    for mode in args.mode:
-        pipeline_map[mode](args)
+    train_loader, val_loader, test_loader, test_data, scalers, boundary_condition = data_pipeline(args)
+
+    if "probe" in args.mode:
+        probe_pipeline(args, train_loader, boundary_condition)
+    if "train" in args.mode:
+        train_pipeline(args, train_loader, val_loader, scalers, boundary_condition)
+    if "infer" in args.mode:
+        inference_pipeline(args, test_loader, test_data)
