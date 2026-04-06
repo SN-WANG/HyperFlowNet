@@ -9,12 +9,13 @@
 ## 📌 Overview
 
 HyperFlowNet keeps the full workflow for this task in one place:
-data loading, staged rollout training, inference, visualization, and memory probing.
+data loading, memory probing, rollout training, inference, and visualization.
 
 The current scope includes:
 
 - irregular-mesh spatio-temporal flow prediction
-- staged autoregressive rollout training
+- shared data pipeline for train / val / test preparation
+- curriculum autoregressive rollout training
 - rollout metrics, plots, and animation rendering
 - GPU memory probing before full training
 
@@ -22,7 +23,9 @@ The current scope includes:
 
 - `HyperFlowNet` as the single maintained model
 - A dedicated `HyperFlowTrainer` built on top of WSNet-style `BaseTrainer`
-- Staged rollout curriculum with scheduled sampling, stage-wise learning rate, and noise injection
+- A lightweight coordinate encoder together with sinusoidal time encoding
+- Shared-assignment slice linear attention for irregular meshes
+- Step-wise BPTT rollout training with rollout curriculum, teacher forcing decay, and noise injection
 - Fluent-style sequence loading, caching, sliding-window augmentation, and normalization
 - Built-in rollout metrics, training curves, error heatmaps, and animation rendering
 - GPU memory probing before full training
@@ -84,6 +87,54 @@ python main.py \
   --data_dir ./dataset \
   --output_dir ./runs/hyperflownet
 ```
+
+### Run the full workflow
+
+```bash
+python main.py \
+  --mode probe train infer \
+  --data_dir ./dataset \
+  --output_dir ./runs/hyperflownet
+```
+
+## ⚙️ Workflow
+
+`main.py` keeps the workflow in four connected parts:
+
+1. `data_pipeline`: build train / val / test splits, fit scalers, and detect hard boundary conditions.
+2. `probe_pipeline`: run one training-like rollout step and estimate peak CUDA memory.
+3. `train_pipeline`: train HyperFlowNet with rollout curriculum on the shared processed loaders.
+4. `inference_pipeline`: restore artifacts from `ckpt.pt`, run autoregressive rollout, and export metrics and figures.
+
+## 🧠 Model Summary
+
+The current `HyperFlowNet` uses:
+
+- a lightweight spatial encoder: `coords`, learned low-frequency features, and learned Fourier features
+- sinusoidal temporal encoding controlled by `time_features`
+- shared-assignment slice linear attention to compress node tokens into slice tokens and mix them in linear-attention form
+- pre-norm residual blocks with token-wise feed-forward networks
+
+The model predicts one step at a time. Full rollout logic stays in `HyperFlowTrainer`, not inside the model forward pass.
+
+## 🏋️ Training Summary
+
+`HyperFlowTrainer` follows a WSNet-style rollout training path:
+
+- weighted step-wise NMSE loss, with later rollout steps receiving larger weights
+- epoch-based rollout curriculum from 1 step up to `max_rollout_steps`
+- Gaussian noise injection during training rollout
+- teacher forcing that decays during curriculum progression
+- AdamW optimizer with cosine annealing learning-rate schedule
+
+Important configuration arguments include:
+
+- `--coords_features`: number of learned spatial encoding features
+- `--time_features`: number of temporal sinusoidal frequency pairs
+- `--num_slices`: number of slice tokens
+- `--max_rollout_steps`: curriculum ceiling for rollout length
+- `--teacher_forcing_init`, `--teacher_forcing_decay`, `--teacher_forcing_floor`
+- `--use_hard_bc` and `--velocity_threshold`
 
 ## 📂 Expected Data Format
 

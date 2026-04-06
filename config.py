@@ -114,12 +114,8 @@ def get_args() -> argparse.Namespace:
         help="Velocity magnitude threshold for wall-node detection."
     )
     model.add_argument(
-        "--coord_features", type=int, default=8,
-        help="Number of learnable spatial Fourier features."
-    )
-    model.add_argument(
-        "--num_fixed_bands", type=int, default=8,
-        help="Number of fixed spatial Fourier bands per coordinate axis."
+        "--coords_features", type=int, default=8,
+        help="Number of learned spatial encoding features."
     )
     model.add_argument(
         "--time_features", type=int, default=4,
@@ -176,6 +172,18 @@ def get_args() -> argparse.Namespace:
     curriculum.add_argument(
         "--noise_decay", type=float, default=0.7,
         help="Multiplicative decay for rollout noise."
+    )
+    curriculum.add_argument(
+        "--teacher_forcing_init", type=float, default=0.25,
+        help="Initial teacher-forcing ratio used after the one-step stage."
+    )
+    curriculum.add_argument(
+        "--teacher_forcing_decay", type=float, default=0.5,
+        help="Multiplicative decay for teacher forcing after each curriculum advance."
+    )
+    curriculum.add_argument(
+        "--teacher_forcing_floor", type=float, default=0.0,
+        help="Minimum teacher-forcing ratio."
     )
 
     return parser.parse_args()

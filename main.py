@@ -120,8 +120,6 @@ def _build_model(args: argparse.Namespace) -> HyperFlowNet:
         HyperFlowNet: Initialized model.
     """
     num_channels = len(args.channel_names)
-    coord_features = max(args.coord_features, 0)
-    num_fixed_bands = max(args.num_fixed_bands, 0)
 
     return HyperFlowNet(
         in_channels=num_channels,
@@ -133,11 +131,9 @@ def _build_model(args: argparse.Namespace) -> HyperFlowNet:
         num_heads=args.num_heads,
         use_spatial_encoding=args.use_spatial_encoding,
         use_temporal_encoding=args.use_temporal_encoding,
-        num_fixed_bands=num_fixed_bands,
-        num_learned_features=coord_features,
+        coords_features=args.coords_features,
         time_features=args.time_features,
         freq_base=args.freq_base,
-        predict_delta=False,
     )
 
 
@@ -171,6 +167,9 @@ def _build_trainer(
         rollout_patience=args.rollout_patience,
         noise_std_init=args.noise_std_init,
         noise_decay=args.noise_decay,
+        teacher_forcing_init=args.teacher_forcing_init,
+        teacher_forcing_decay=args.teacher_forcing_decay,
+        teacher_forcing_floor=args.teacher_forcing_floor,
         boundary_condition=boundary_condition,
         channel_weights=args.channel_weights,
         scalers=scalers,
@@ -303,19 +302,12 @@ def probe_pipeline(
 
     torch.cuda.reset_peak_memory_stats(device)
 
-    input_state = seq_std[:, 0]
-    target_seq = seq_std[:, 1:k + 1]
-    pred_seq = trainer.model(
-        inputs=input_state,
-        coords=coords_norm,
-        t_norm=start_t_norm,
-        dt_norm=dt_norm,
-        targets=target_seq,
+    loss = trainer.compute_rollout_loss(
+        batch=(seq_std, coords_norm, start_t_norm, dt_norm),
+        rollout_steps=k,
         teacher_forcing_ratio=0.0,
         noise_std=0.0,
-        boundary_condition=boundary_condition,
     )
-    loss = trainer.criterion(pred_seq, target_seq)
     loss.backward()
     trainer.optimizer.step()
 
