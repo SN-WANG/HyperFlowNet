@@ -8,7 +8,6 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 import pyvista as pv
-import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
@@ -614,9 +613,9 @@ class FlowVis:
                 panes[ch_idx][1].point_data["scalar"] = pred_np[step_idx, :, ch_idx].astype(np.float32)
                 panes[ch_idx][2].point_data["scalar"] = rel_np[step_idx, :, ch_idx].astype(np.float32)
 
-        out_path = self.output_dir / f"{case_name}_comp.mp4"
+        out_path = self.output_dir / f"{case_name}_full.mp4"
         self._mp4(plotter, _update, seq_len, out_path, desc=f"Rendering {case_name} full")
-        logger.info(f"comparison video saved to {hue.g}{out_path}{hue.q}")
+        logger.info(f"full video saved to {hue.g}{out_path}{hue.q}")
 
     def render_focus(
         self,
@@ -714,21 +713,3 @@ class FlowVis:
         out_path = self.output_dir / f"{case_name}_focus_{channel_name.lower()}.mp4"
         self._mp4(plotter, _update, seq_len, out_path, desc=f"Rendering {case_name} focus")
         logger.info(f"focus video saved to {hue.g}{out_path}{hue.q}")
-
-
-if __name__ == "__main__":
-    spatial_dim = 2
-    T, N, C = 20, 2000, spatial_dim + 2
-
-    mock_coords = torch.rand(N, spatial_dim)
-    time_steps = torch.linspace(0, 4 * np.pi, T).view(T, 1, 1)
-    wave = torch.sin(time_steps + mock_coords[:, 0].view(1, N, 1) * 5)
-    mock_gt = wave.expand(T, N, C).clone()
-    mock_gt[:, :, spatial_dim] = torch.rand(T, N) * 4e6 + 5e5
-    mock_gt[:, :, spatial_dim + 1] = 300.0 + torch.randn(T, N) * 0.5
-    mock_pred = mock_gt * 0.95 + torch.randn_like(mock_gt) * 0.05
-
-    vis = FlowVis(output_dir="vis_outputs", spatial_dim=spatial_dim, fps=10)
-    vis.render_seq(mock_gt, mock_coords, case_name="demo_seq")
-    vis.render_full(mock_gt, mock_pred, mock_coords, case_name="demo_comp", num_nodes=N, num_params=813844)
-    vis.render_focus(mock_gt, mock_pred, mock_coords, case_name="demo", num_nodes=N, num_params=813844)

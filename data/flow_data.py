@@ -48,8 +48,8 @@ class FlowData(Dataset):
 
         self.seqs: List[Tensor] = []
         self.coords: List[Tensor] = []
-        self.start_ts_norm: List[float] = []
-        self.dts_norm: List[float] = []
+        self.t0_norm: List[float] = []
+        self.dt_norm: List[float] = []
 
         logger.info(f"initializing dataset with {hue.m}{len(case_names)}{hue.q} cases...")
 
@@ -73,8 +73,8 @@ class FlowData(Dataset):
                 self.coords.append(coords_tensor)
 
                 T = states_tensor.shape[0]
-                self.start_ts_norm.append(0.0)
-                self.dts_norm.append(1.0 / (T - 1) if T > 1 else 0.0)
+                self.t0_norm.append(0.0)
+                self.dt_norm.append(1.0 / (T - 1) if T > 1 else 0.0)
 
         logger.info(f"{hue.g}dataset initialized.{hue.q} cases: {hue.m}{len(self.seqs)}{hue.q}, "
                     f"frames: {hue.m}{self.seqs[0].shape[0]}{hue.q}, "
@@ -85,7 +85,7 @@ class FlowData(Dataset):
         return len(self.seqs)
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, float, float]:
-        return self.seqs[idx], self.coords[idx], self.start_ts_norm[idx], self.dts_norm[idx]
+        return self.seqs[idx], self.coords[idx], self.t0_norm[idx], self.dt_norm[idx]
 
     def get_stats(self) -> Tuple[Tensor, Tensor]:
         """Calculates mean and std across the feature dimension (C)."""
@@ -189,12 +189,12 @@ class FlowData(Dataset):
         """Applies vectorized sliding window slicing for temporal augmentation."""
         new_seqs: List[Tensor] = []
         new_coords: List[Tensor] = []
-        new_start_ts_norm: List[float] = []
-        new_dts_norm: List[float] = []
+        new_t0_norm: List[float] = []
+        new_dt_norm: List[float] = []
 
         logger.info(f"augmenting dataset with {hue.m}{len(dataset)}{hue.q} cases...")
 
-        pbar = tqdm(zip(dataset.seqs, dataset.coords, dataset.start_ts_norm, dataset.dts_norm),
+        pbar = tqdm(zip(dataset.seqs, dataset.coords, dataset.t0_norm, dataset.dt_norm),
                     total=len(dataset),
                     desc=f"[FlowData] data augmenting", leave=False, dynamic_ncols=True)
 
@@ -210,19 +210,19 @@ class FlowData(Dataset):
             for i in range(unfolded.shape[0]):
                 new_seqs.append(unfolded[i])
                 new_coords.append(coord)
-                new_start_ts_norm.append(i * win_stride * dt_norm)
-                new_dts_norm.append(dt_norm)
+                new_t0_norm.append(i * win_stride * dt_norm)
+                new_dt_norm.append(dt_norm)
 
         # shuffle across all cases
-        combined = list(zip(new_seqs, new_coords, new_start_ts_norm, new_dts_norm))
+        combined = list(zip(new_seqs, new_coords, new_t0_norm, new_dt_norm))
         rng = np.random.default_rng(seed=42)
         rng.shuffle(combined)
 
-        dataset.seqs, dataset.coords, dataset.start_ts_norm, dataset.dts_norm = zip(*combined)
+        dataset.seqs, dataset.coords, dataset.t0_norm, dataset.dt_norm = zip(*combined)
         dataset.seqs = list(dataset.seqs)
         dataset.coords = list(dataset.coords)
-        dataset.start_ts_norm = list(dataset.start_ts_norm)
-        dataset.dts_norm = list(dataset.dts_norm)
+        dataset.t0_norm = list(dataset.t0_norm)
+        dataset.dt_norm = list(dataset.dt_norm)
 
         logger.info(f"{hue.g}data augmented.{hue.q} cases: {hue.m}{len(dataset)}{hue.q}, "
                     f"frames: {hue.m}{dataset.seqs[0].shape[0]}{hue.q}, "

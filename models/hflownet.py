@@ -287,8 +287,8 @@ class HyperFlowNet(nn.Module):
         spatial_dim: int,
         width: int = 128,
         depth: int = 4,
-        num_heads: int = 8,
         num_slices: int = 32,
+        num_heads: int = 8,
         ffn_ratio: float = 4.0,
         use_spatial_encoding: bool = True,
         use_temporal_encoding: bool = True,
@@ -305,8 +305,8 @@ class HyperFlowNet(nn.Module):
             spatial_dim (int): Spatial coordinate dimension.
             width (int): Hidden token width.
             depth (int): Number of stacked HyperFlow blocks.
-            num_heads (int): Number of attention heads.
             num_slices (int): Number of slice tokens used by the slice operator.
+            num_heads (int): Number of attention heads.
             ffn_ratio (float): Expansion ratio of the feed-forward network.
             use_spatial_encoding (bool): Whether to encode coordinates before concatenation.
             use_temporal_encoding (bool): Whether to append a sinusoidal time embedding.
@@ -394,7 +394,7 @@ class HyperFlowNet(nn.Module):
         inputs: Tensor,
         coords: Tensor,
         steps: int,
-        start_t_norm: Optional[Tensor] = None,
+        t0_norm: Optional[Tensor] = None,
         dt_norm: Optional[Tensor] = None,
         boundary_condition=None,
     ) -> Tensor:
@@ -405,7 +405,7 @@ class HyperFlowNet(nn.Module):
             inputs (Tensor): Initial rollout state. (B, N, C_IN).
             coords (Tensor): Node coordinates. (B, N, D).
             steps (int): Number of rollout steps.
-            start_t_norm (Optional[Tensor]): Starting normalized time index. (B,).
+            t0_norm (Optional[Tensor]): Initial normalized time index. (B,).
             dt_norm (Optional[Tensor]): Normalized time increment per rollout step. (B,).
             boundary_condition: Optional boundary-condition object exposing an `enforce` method.
 
@@ -416,10 +416,10 @@ class HyperFlowNet(nn.Module):
         input_state = inputs.to(device)
         coords = coords.to(device)
 
-        if start_t_norm is None:
-            start_t_norm = torch.zeros(input_state.shape[0], device=device, dtype=input_state.dtype)
+        if t0_norm is None:
+            t0_norm = torch.zeros(input_state.shape[0], device=device, dtype=input_state.dtype)
         else:
-            start_t_norm = start_t_norm.to(device=device, dtype=input_state.dtype)
+            t0_norm = t0_norm.to(device=device, dtype=input_state.dtype)
 
         if dt_norm is None:
             dt_norm = torch.full((input_state.shape[0],), 1.0 / max(steps, 1), device=device, dtype=input_state.dtype)
@@ -430,7 +430,7 @@ class HyperFlowNet(nn.Module):
 
         with torch.no_grad():
             for step_idx in tqdm(range(steps), desc="Predicting", leave=False, dynamic_ncols=True):
-                step_t_norm = start_t_norm + step_idx * dt_norm
+                step_t_norm = t0_norm + step_idx * dt_norm
                 next_state = self(input_state, coords, t_norm=step_t_norm)
 
                 if boundary_condition is not None:

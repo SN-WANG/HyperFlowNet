@@ -149,7 +149,7 @@ class BoundaryCondition:
         """Restore internal state from a checkpoint.
 
         Args:
-            state_dict: Dictionary previously returned by ``state_dict()``.
+            state_dict: Dictionary previously returned by state_dict().
         """
         self.wall_mask = state_dict["wall_mask"]
         self.wall_values_std = state_dict["wall_values_std"]

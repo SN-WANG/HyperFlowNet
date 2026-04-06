@@ -183,7 +183,7 @@ class HyperFlowTrainer(BaseTrainer):
         Compute weighted rollout loss with step-wise BPTT.
 
         Args:
-            batch (Any): Batch tuple `(seq, coords, start_t_norm, dt_norm)`.
+            batch (Any): Batch tuple `(seq, coords, t0_norm, dt_norm)`.
             rollout_steps (int): Rollout horizon used for this pass.
             teacher_forcing_ratio (float): Probability of feeding ground-truth states between rollout steps.
             noise_std (float): Gaussian noise std injected into the rollout input during training.
@@ -191,12 +191,12 @@ class HyperFlowTrainer(BaseTrainer):
         Returns:
             Tensor: Scalar rollout loss. ().
         """
-        seq, coords, start_t_norm, dt_norm = batch
+        seq, coords, t0_norm, dt_norm = batch
 
         num_steps = min(int(rollout_steps), seq.shape[1] - 1)
         input_state = seq[:, 0]
         batch_size = seq.shape[0]
-        base_time = start_t_norm.to(device=input_state.device, dtype=input_state.dtype)
+        t0_norm = t0_norm.to(device=input_state.device, dtype=input_state.dtype)
         step_dt_norm = dt_norm.to(device=input_state.device, dtype=input_state.dtype)
 
         total_weight = num_steps * (num_steps + 1)
@@ -207,7 +207,7 @@ class HyperFlowTrainer(BaseTrainer):
             if self.model.training and noise_std > 0.0:
                 step_input = step_input + noise_std * torch.randn_like(step_input)
 
-            step_t_norm = base_time + step_idx * step_dt_norm
+            step_t_norm = t0_norm + step_idx * step_dt_norm
             pred_state = self.model(step_input, coords, t_norm=step_t_norm)
 
             if self.boundary_condition is not None:
@@ -236,7 +236,7 @@ class HyperFlowTrainer(BaseTrainer):
         Compute weighted rollout loss.
 
         Args:
-            batch (Any): Batch tuple `(seq, coords, start_t_norm, dt_norm)`.
+            batch (Any): Batch tuple `(seq, coords, t0_norm, dt_norm)`.
 
         Returns:
             Tensor: Scalar rollout loss. ().

@@ -14,13 +14,14 @@ import config
 
 from data.boundary import BoundaryCondition
 from data.flow_data import FlowData
-from data.flow_plot import plot_error_heatmap, plot_metrics_comparison, plot_rollout_error, plot_training_curves
 from data.flow_vis import FlowVis
+
 from models.hflownet import HyperFlowNet
 from training.hyperflow_trainer import HyperFlowTrainer
+
+from utils.seeder import seed_everything
 from utils.hue_logger import hue, logger
 from utils.scaler import MinMaxScalerTensor, StandardScalerTensor
-from utils.seeder import seed_everything
 
 
 class Metrics:
@@ -109,6 +110,43 @@ class Metrics:
         return results
 
 
+def _log_pipeline_banner(name: str, stage: str, color: str) -> None:
+    """
+    Log a visible banner for pipeline boundaries.
+
+    Args:
+        name (str): Pipeline name.
+        stage (str): Pipeline stage label.
+        color (str): ANSI color prefix from HueLogger.
+    """
+    title = f" [{name}] {stage} "
+    width = 84
+    num_eq = max(8, width - len(title))
+    left = "=" * (num_eq // 2)
+    right = "=" * (num_eq - len(left))
+    logger.info(f"{color}{left}{title}{right}{hue.q}")
+
+
+def _log_pipeline_start(name: str) -> None:
+    """
+    Log the start of a pipeline.
+
+    Args:
+        name (str): Pipeline name.
+    """
+    _log_pipeline_banner(name, "START", hue.c)
+
+
+def _log_pipeline_end(name: str) -> None:
+    """
+    Log the end of a pipeline.
+
+    Args:
+        name (str): Pipeline name.
+    """
+    _log_pipeline_banner(name, "END", hue.g)
+
+
 def _build_model(args: argparse.Namespace) -> HyperFlowNet:
     """
     Instantiate HyperFlowNet from the parsed configuration.
@@ -192,7 +230,7 @@ def data_pipeline(
             Train, validation, and test loaders together with the raw test dataset,
             fitted scalers, and optional boundary condition.
     """
-    logger.info("initializing datasets...")
+    _log_pipeline_start("DATA PIPELINE")
     train_data, val_data, test_data = FlowData.spawn(
         data_dir=args.data_dir,
         spatial_dim=args.spatial_dim,
@@ -223,12 +261,12 @@ def data_pipeline(
     processed_splits = []
     for dataset in (train_data, val_data, test_data):
         samples = []
-        for seq, coord, start_t_norm, dt_norm in dataset:
+        for seq, coord, t0_norm, dt_norm in dataset:
             seq_std = feature_scaler.transform(seq)
             coords_norm = coord_scaler.transform(coord)
-            start_t_norm = torch.tensor(start_t_norm, dtype=seq_std.dtype)
+            t0_norm = torch.tensor(t0_norm, dtype=seq_std.dtype)
             dt_norm = torch.tensor(dt_norm, dtype=seq_std.dtype)
-            samples.append((seq_std, coords_norm, start_t_norm, dt_norm))
+            samples.append((seq_std, coords_norm, t0_norm, dt_norm))
         processed_splits.append(samples)
 
     train_samples, val_samples, test_samples = processed_splits
@@ -256,6 +294,7 @@ def data_pipeline(
         pin_memory=pin_memory,
     )
 
+    _log_pipeline_end("DATA PIPELINE")
     return train_loader, val_loader, test_loader, test_data, scalers, boundary_condition
 
 
@@ -272,15 +311,17 @@ def probe_pipeline(
         train_loader (DataLoader): Training data loader.
         boundary_condition (BoundaryCondition | None): Optional boundary-condition enforcer.
     """
+    _log_pipeline_start("PROBE PIPELINE")
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
         logger.warning("No CUDA device - probe skipped.")
+        _log_pipeline_end("PROBE PIPELINE")
         return
 
-    seq_std, coords_norm, start_t_norm, dt_norm = next(iter(train_loader))
+    seq_std, coords_norm, t0_norm, dt_norm = next(iter(train_loader))
     seq_std = seq_std.to(device)
     coords_norm = coords_norm.to(device)
-    start_t_norm = start_t_norm.to(device)
+    t0_norm = t0_norm.to(device)
     dt_norm = dt_norm.to(device)
 
     output_dir = Path(args.output_dir)
@@ -303,7 +344,7 @@ def probe_pipeline(
     torch.cuda.reset_peak_memory_stats(device)
 
     loss = trainer.compute_rollout_loss(
-        batch=(seq_std, coords_norm, start_t_norm, dt_norm),
+        batch=(seq_std, coords_norm, t0_norm, dt_norm),
         rollout_steps=k,
         teacher_forcing_ratio=0.0,
         noise_std=0.0,
@@ -327,7 +368,7 @@ def probe_pipeline(
         f"({hue.m}{total / 1e9:.1f}{hue.q} GB)"
     )
     logger.info(f"peak usage: {hue.m}{peak / 1e9:.2f}{hue.q} GB ({hue.m}{pct:.1f}{hue.q} %) -> {status}")
-    logger.info(f"{hue.g}probe completed.{hue.q}")
+    _log_pipeline_end("PROBE PIPELINE")
 
 
 def train_pipeline(
@@ -347,6 +388,7 @@ def train_pipeline(
         scalers (Dict[str, object]): Fitted feature and coordinate scalers.
         boundary_condition (BoundaryCondition | None): Optional boundary-condition enforcer.
     """
+    _log_pipeline_start("TRAIN PIPELINE")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -356,6 +398,7 @@ def train_pipeline(
 
     trainer = _build_trainer(args, model, scalers, output_dir, boundary_condition=boundary_condition)
     trainer.fit(train_loader, val_loader)
+    _log_pipeline_end("TRAIN PIPELINE")
 
 
 def inference_pipeline(
@@ -371,6 +414,7 @@ def inference_pipeline(
         test_loader (DataLoader): Test data loader from the shared data pipeline.
         test_data (FlowData): Raw test dataset from the shared data pipeline.
     """
+    _log_pipeline_start("INFERENCE PIPELINE")
     device = torch.device(args.device)
     run_dir = Path(args.output_dir)
     model_path = run_dir / "ckpt.pt"
@@ -378,7 +422,6 @@ def inference_pipeline(
     if not model_path.exists():
         raise FileNotFoundError(f"ckpt.pt not found at {model_path}.")
 
-    logger.info("loading training artifacts...")
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     scaler_state = checkpoint["scaler_state_dict"]
 
@@ -394,7 +437,7 @@ def inference_pipeline(
         boundary_condition.load_state_dict(scaler_state["boundary_condition"])
 
     if boundary_condition is not None:
-        logger.info(f"boundary condition restored: {hue.m}{int(boundary_condition.wall_mask.sum())}{hue.q} wall nodes")
+        logger.info(f"boundary condition: {hue.m}{int(boundary_condition.wall_mask.sum())}{hue.q} wall nodes")
 
     model = _build_model(args)
     num_params = sum(p.numel() for p in model.parameters())
@@ -404,21 +447,16 @@ def inference_pipeline(
     model.to(device)
     model.eval()
 
-    logger.info(f"{hue.g}running inference on test set...{hue.q}")
-    visualizer = FlowVis(
-        output_dir=run_dir,
-        spatial_dim=args.spatial_dim,
-        channel_names=args.channel_names,
-    )
+    visualizer = FlowVis(output_dir=run_dir, spatial_dim=args.spatial_dim, channel_names=args.channel_names)
     metrics_evaluator = Metrics(channel_names=args.channel_names)
 
     case_metrics: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
 
     with torch.no_grad():
-        for i, (seq_std, coords_norm, start_t_norm, dt_norm) in enumerate(test_loader):
+        for i, (seq_std, coords_norm, t0_norm, dt_norm) in enumerate(test_loader):
             seq_std = seq_std.to(device)
             coords_norm = coords_norm.to(device)
-            start_t_norm = start_t_norm.to(device)
+            t0_norm = t0_norm.to(device)
             dt_norm = dt_norm.to(device)
 
             case_name = test_data.case_names[i]
@@ -426,14 +464,7 @@ def inference_pipeline(
             initial_state = seq_std[:, 0]
             coords_raw = test_data.coords[i].cpu()
 
-            pred_seq_std = model.predict(
-                initial_state,
-                coords_norm,
-                steps,
-                start_t_norm=start_t_norm,
-                dt_norm=dt_norm,
-                boundary_condition=boundary_condition,
-            )
+            pred_seq_std = model.predict(initial_state, coords_norm, steps, t0_norm, dt_norm, boundary_condition)
 
             pred_seq = feature_scaler.inverse_transform(pred_seq_std).cpu().squeeze(0)
             gt_seq = feature_scaler.inverse_transform(seq_std).cpu().squeeze(0)
@@ -456,11 +487,9 @@ def inference_pipeline(
             torch.save(pred_seq, run_dir / f"{case_name}_pred.pt")
 
             num_nodes = int(coords_raw.shape[0])
-            if "Vy" in args.channel_names:
-                focus_channel_idx = args.channel_names.index("Vy")
-            else:
-                focus_channel_idx = min(1, len(args.channel_names) - 1)
-            focus_bbox_rel = (0.60, 1.00, 0.00, 1.00) if args.spatial_dim == 2 else (0.60, 1.00, 0.00, 1.00, 0.00, 1.00)
+            focus_channel_idx = len(args.channel_names) - 1
+            focus_bbox_rel = (0.60, 1.00, 0.00, 1.00) if args.spatial_dim == 2 \
+            else (0.60, 1.00, 0.00, 1.00, 0.00, 1.00)
 
             visualizer.render_full(
                 gt=gt_seq,
@@ -481,41 +510,10 @@ def inference_pipeline(
                 focus_bbox_rel=focus_bbox_rel,
             )
 
-            plot_rollout_error(
-                pred=pred_seq,
-                gt=gt_seq,
-                channel_names=args.channel_names,
-                output_path=str(run_dir / f"{case_name}_rollout_error.png"),
-            )
-
-            num_steps = pred_seq.shape[0]
-            for step_idx, step_name in [(0, "first"), (num_steps // 2, "mid"), (num_steps - 1, "last")]:
-                plot_error_heatmap(
-                    gt=gt_seq,
-                    pred=pred_seq,
-                    coords=coords_raw,
-                    timestep=step_idx,
-                    channel_names=args.channel_names,
-                    output_path=str(run_dir / f"{case_name}_error_t{step_idx}_{step_name}.png"),
-                )
-
-    with open(run_dir / "test_metrics.json", "w") as f:
+    with open(run_dir / "metrics.json", "w") as f:
         json.dump(case_metrics, f, indent=4)
 
-    history_path = run_dir / "history.json"
-    if history_path.exists():
-        plot_training_curves(
-            history_paths={"HyperFlowNet": str(history_path)},
-            output_path=str(run_dir / "training_curve.png"),
-        )
-
-    plot_metrics_comparison(
-        metrics_paths={"HyperFlowNet": str(run_dir / "test_metrics.json")},
-        output_path=str(run_dir / "metrics_comparison.png"),
-        channel_names=args.channel_names,
-    )
-
-    logger.info(f"{hue.g}inference completed.{hue.q}")
+    _log_pipeline_end("INFERENCE PIPELINE")
 
 
 if __name__ == "__main__":
