@@ -322,7 +322,10 @@ def probe_pipeline(
     else:
         status = f"{hue.r}CRITICAL - likely OOM in real training{hue.q}"
 
-    logger.info(f"{hue.y}device: {hue.b}{torch.cuda.get_device_name(device)}{hue.q} ({hue.m}{total / 1e9:.1f}{hue.q} GB)")
+    logger.info(
+        f"{hue.y}device: {hue.b}{torch.cuda.get_device_name(device)}{hue.q} "
+        f"({hue.m}{total / 1e9:.1f}{hue.q} GB)"
+    )
     logger.info(f"peak usage: {hue.m}{peak / 1e9:.2f}{hue.q} GB ({hue.m}{pct:.1f}{hue.q} %) -> {status}")
     logger.info(f"{hue.g}probe completed.{hue.q}")
 
@@ -402,7 +405,11 @@ def inference_pipeline(
     model.eval()
 
     logger.info(f"{hue.g}running inference on test set...{hue.q}")
-    visualizer = FlowVis(output_dir=run_dir, spatial_dim=args.spatial_dim)
+    visualizer = FlowVis(
+        output_dir=run_dir,
+        spatial_dim=args.spatial_dim,
+        channel_names=args.channel_names,
+    )
     metrics_evaluator = Metrics(channel_names=args.channel_names)
 
     case_metrics: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
@@ -448,7 +455,31 @@ def inference_pipeline(
 
             torch.save(pred_seq, run_dir / f"{case_name}_pred.pt")
 
-            visualizer.animate_comparison(gt=gt_seq, pred=pred_seq, coords=coords_raw, case_name=case_name)
+            num_nodes = int(coords_raw.shape[0])
+            if "Vy" in args.channel_names:
+                focus_channel_idx = args.channel_names.index("Vy")
+            else:
+                focus_channel_idx = min(1, len(args.channel_names) - 1)
+            focus_bbox_rel = (0.74, 1.00, 0.00, 1.00) if args.spatial_dim == 2 else (0.74, 1.00, 0.00, 1.00, 0.00, 1.00)
+
+            visualizer.render_full(
+                gt=gt_seq,
+                pred=pred_seq,
+                coords=coords_raw,
+                case_name=case_name,
+                num_nodes=num_nodes,
+                num_params=num_params,
+            )
+            visualizer.render_focus(
+                gt=gt_seq,
+                pred=pred_seq,
+                coords=coords_raw,
+                case_name=case_name,
+                num_nodes=num_nodes,
+                num_params=num_params,
+                focus_channel_idx=focus_channel_idx,
+                focus_bbox_rel=focus_bbox_rel,
+            )
 
             plot_rollout_error(
                 pred=pred_seq,
