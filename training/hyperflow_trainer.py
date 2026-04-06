@@ -61,23 +61,20 @@ class RolloutCriterion(nn.Module):
 
 class HyperFlowTrainer(BaseTrainer):
     """
-    Rollout trainer for HyperFlowNet with step-wise BPTT curriculum.
+    Rollout trainer for HyperFlowNet with step-wise curriculum and noise injection.
     """
 
     def __init__(
         self,
         model: nn.Module,
         lr: float = 5e-4,
-        max_epochs: int = 560,
+        max_epochs: int = 320,
         weight_decay: float = 1e-4,
         eta_min: float = 1e-6,
         max_rollout_steps: int = 12,
-        rollout_patience: int = 55,
+        rollout_patience: int = 24,
         noise_std_init: float = 0.01,
-        noise_decay: float = 0.7,
-        teacher_forcing_init: float = 0.25,
-        teacher_forcing_decay: float = 0.5,
-        teacher_forcing_floor: float = 0.0,
+        noise_decay: float = 0.75,
         boundary_condition: Optional[Any] = None,
         **kwargs,
     ) -> None:
@@ -94,9 +91,6 @@ class HyperFlowTrainer(BaseTrainer):
             rollout_patience (int): Epoch interval between curriculum updates.
             noise_std_init (float): Initial rollout noise std.
             noise_decay (float): Multiplicative decay of rollout noise.
-            teacher_forcing_init (float): Initial teacher-forcing ratio after the one-step warmup stage.
-            teacher_forcing_decay (float): Multiplicative decay of teacher forcing after each curriculum advance.
-            teacher_forcing_floor (float): Minimal teacher-forcing ratio.
             boundary_condition (Optional[Any]): Optional boundary-condition enforcer.
             **kwargs: Arguments forwarded to BaseTrainer.
         """
@@ -128,15 +122,10 @@ class HyperFlowTrainer(BaseTrainer):
         self.rollout_patience = rollout_patience
         self.noise_std_init = noise_std_init
         self.noise_decay = noise_decay
-        self.teacher_forcing_init = teacher_forcing_init
-        self.teacher_forcing_decay = teacher_forcing_decay
-        self.teacher_forcing_floor = teacher_forcing_floor
 
-        self.rollout_counter = 0
-        self.log_update_info = False
         self.current_rollout_steps = 1
         self.current_noise_std = noise_std_init
-        self.current_teacher_forcing_ratio = teacher_forcing_init
+        self.curriculum_counter = 0
 
         self.boundary_condition = boundary_condition
 
@@ -144,27 +133,22 @@ class HyperFlowTrainer(BaseTrainer):
         """
         Advance the rollout curriculum.
         """
-        self.rollout_counter += 1
+        self.curriculum_counter += 1
 
-        if self.rollout_counter >= self.rollout_patience:
-            if self.current_rollout_steps < self.max_rollout_steps:
-                self.current_rollout_steps += 1
-                self.current_noise_std *= self.noise_decay
-                self.current_teacher_forcing_ratio = max(
-                    self.teacher_forcing_floor,
-                    self.current_teacher_forcing_ratio * self.teacher_forcing_decay,
-                )
-                self.rollout_counter = 0
-                self.log_update_info = True
+        if self.curriculum_counter < self.rollout_patience:
+            return
 
-        if self.log_update_info and self.rollout_counter == 1:
-            logger.info(
-                f"{hue.y}curriculum update:{hue.q} "
-                f"steps = {hue.m}{self.current_rollout_steps}{hue.q}, "
-                f"noise = {hue.m}{self.current_noise_std:.4f}{hue.q}, "
-                f"teacher forcing = {hue.m}{self.current_teacher_forcing_ratio:.3f}{hue.q}"
-            )
-            self.log_update_info = False
+        self.curriculum_counter = 0
+        if self.current_rollout_steps >= self.max_rollout_steps:
+            return
+
+        self.current_rollout_steps += 1
+        self.current_noise_std *= self.noise_decay
+        logger.info(
+            f"{hue.y}curriculum update:{hue.q} "
+            f"steps = {hue.m}{self.current_rollout_steps}{hue.q}, "
+            f"noise = {hue.m}{self.current_noise_std:.4f}{hue.q}"
+        )
 
     def _on_epoch_end(self, train_loss=None, val_loss=None, **kwargs) -> None:
         """
@@ -172,30 +156,23 @@ class HyperFlowTrainer(BaseTrainer):
         """
         self._update_curriculum()
 
-    def compute_rollout_loss(
-        self,
-        batch: Any,
-        rollout_steps: int,
-        teacher_forcing_ratio: float,
-        noise_std: float,
-    ) -> Tensor:
+    def _compute_loss(self, batch: Any) -> Tensor:
         """
         Compute weighted rollout loss with step-wise BPTT.
 
         Args:
             batch (Any): Batch tuple `(seq, coords, t0_norm, dt_norm)`.
-            rollout_steps (int): Rollout horizon used for this pass.
-            teacher_forcing_ratio (float): Probability of feeding ground-truth states between rollout steps.
-            noise_std (float): Gaussian noise std injected into the rollout input during training.
 
         Returns:
             Tensor: Scalar rollout loss. ().
         """
+        rollout_steps = self.current_rollout_steps
+        noise_std = self.current_noise_std if self.model.training else 0.0
+
         seq, coords, t0_norm, dt_norm = batch
 
         num_steps = min(int(rollout_steps), seq.shape[1] - 1)
         input_state = seq[:, 0]
-        batch_size = seq.shape[0]
         t0_norm = t0_norm.to(device=input_state.device, dtype=input_state.dtype)
         step_dt_norm = dt_norm.to(device=input_state.device, dtype=input_state.dtype)
 
@@ -217,37 +194,7 @@ class HyperFlowTrainer(BaseTrainer):
             weight_t = 2.0 * (step_idx + 1) / total_weight
             loss = loss + weight_t * self.criterion(pred_state, target_state)
 
-            if step_idx >= num_steps - 1:
-                continue
-
-            if teacher_forcing_ratio >= 1.0:
-                input_state = target_state
-            elif teacher_forcing_ratio <= 0.0:
+            if step_idx < num_steps - 1:
                 input_state = pred_state
-            else:
-                use_truth = (torch.rand(batch_size, device=pred_state.device) < teacher_forcing_ratio)
-                use_truth = use_truth.to(dtype=pred_state.dtype).view(-1, 1, 1)
-                input_state = use_truth * target_state + (1.0 - use_truth) * pred_state
 
         return loss
-
-    def _compute_loss(self, batch: Any) -> Tensor:
-        """
-        Compute weighted rollout loss.
-
-        Args:
-            batch (Any): Batch tuple `(seq, coords, t0_norm, dt_norm)`.
-
-        Returns:
-            Tensor: Scalar rollout loss. ().
-        """
-        if self.model.training:
-            rollout_steps = self.current_rollout_steps
-            teacher_forcing_ratio = self.current_teacher_forcing_ratio
-            noise_std = self.current_noise_std
-        else:
-            rollout_steps = self.current_rollout_steps
-            teacher_forcing_ratio = 0.0
-            noise_std = 0.0
-
-        return self.compute_rollout_loss(batch, rollout_steps, teacher_forcing_ratio, noise_std)

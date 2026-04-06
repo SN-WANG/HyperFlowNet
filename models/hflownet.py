@@ -1,7 +1,8 @@
 # HyperFlowNet for spatio-temporal irregular-mesh flow prediction
 # Author: Shengning Wang
 
-from typing import List, Optional
+from math import pi, sqrt
+from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -12,63 +13,6 @@ from tqdm.auto import tqdm
 # ============================================================
 # Encoding Blocks
 # ============================================================
-
-
-class SpatialEncoder(nn.Module):
-    """
-    Lightweight coordinate encoder with learned low-frequency and Fourier features.
-    """
-
-    def __init__(
-        self,
-        spatial_dim: int,
-        coords_features: int = 8,
-        learned_scale: float = 1.0,
-    ) -> None:
-        """
-        Initialize the spatial encoder.
-
-        Args:
-            spatial_dim (int): Spatial coordinate dimension.
-            coords_features (int): Number of learned low-frequency and Fourier features.
-            learned_scale (float): Initialization scale of the learned frequency matrix.
-        """
-        super().__init__()
-
-        self.spatial_dim = spatial_dim
-        self.coords_features = coords_features
-
-        if coords_features > 0:
-            self.low_freq_proj = nn.Sequential(
-                nn.Linear(spatial_dim, coords_features),
-                nn.GELU(),
-                nn.Linear(coords_features, coords_features),
-            )
-            self.freq_matrix = nn.Parameter(learned_scale * torch.randn(spatial_dim, coords_features))
-            self.out_dim = spatial_dim + 3 * coords_features
-        else:
-            self.low_freq_proj = None
-            self.freq_matrix = None
-            self.out_dim = spatial_dim
-
-    def forward(self, coords: Tensor) -> Tensor:
-        """
-        Encode mesh coordinates into lightweight geometry features.
-
-        Args:
-            coords (Tensor): Node coordinates. (B, N, D).
-
-        Returns:
-            Tensor: Encoded spatial features. (B, N, C).
-        """
-        if self.coords_features <= 0:
-            return coords
-
-        coords = coords.to(dtype=self.freq_matrix.dtype)
-        low_freq = self.low_freq_proj(coords)
-        phases = (2.0 * torch.pi) * (coords @ self.freq_matrix)
-        return torch.cat([coords, low_freq, torch.sin(phases), torch.cos(phases)], dim=-1)
-
 
 class TemporalEncoder(nn.Module):
     """
@@ -101,7 +45,7 @@ class TemporalEncoder(nn.Module):
             num_nodes (int): Number of mesh nodes.
 
         Returns:
-            Tensor: Time features. (B, N, C).
+            Tensor: Time features. (B, N, C_TIME).
         """
         t_scaled = t_norm.float() * self.freq_base
         angles = self.omega.unsqueeze(0) * t_scaled.unsqueeze(1)
@@ -109,164 +53,336 @@ class TemporalEncoder(nn.Module):
         return embedding.unsqueeze(1).expand(-1, num_nodes, -1)
 
 
-# ============================================================
-# Token Blocks
-# ============================================================
-
-
-class SliceAttention(nn.Module):
+class NodeStem(nn.Module):
     """
-    Shared-assignment slice linear attention for irregular mesh node tokens.
+    Node embedding stem with compact coordinate, time, and boundary-aware geometry features.
     """
 
-    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        spatial_dim: int,
+        width: int,
+        latent_dim: int,
+        time_features: int = 4,
+        freq_base: int = 1000,
+    ) -> None:
         """
-        Initialize the mesh slice attention module.
+        Initialize the node stem.
 
         Args:
-            hidden_dim (int): Hidden token width.
-            num_heads (int): Number of attention heads.
-            num_slices (int): Number of slice tokens used to compress the node set.
+            in_channels (int): Number of node input channels.
+            spatial_dim (int): Spatial coordinate dimension.
+            width (int): Node token width.
+            latent_dim (int): Geometry token width.
+            time_features (int): Number of temporal sinusoidal frequency pairs.
+            freq_base (int): Base for temporal frequencies.
         """
         super().__init__()
-        if hidden_dim % num_heads != 0:
-            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}")
+        self.in_channels = in_channels
+        self.spatial_dim = spatial_dim
+        self.width = width
+        self.latent_dim = latent_dim
 
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
+        unit_directions = self._build_unit_directions(spatial_dim)
+        self.register_buffer("unit_directions", unit_directions, persistent=False)
+
+        self.time_encoder = TemporalEncoder(
+            time_features=time_features, freq_base=freq_base) if time_features > 0 else None
+        self.geometry_dim = 3 * spatial_dim + unit_directions.shape[0] + 2
+        self.time_dim = 0 if self.time_encoder is None else self.time_encoder.out_dim
+
+        self.node_proj = nn.Linear(in_channels + self.geometry_dim + self.time_dim, width)
+        self.node_norm = nn.LayerNorm(width)
+        self.geometry_proj = nn.Linear(self.geometry_dim, latent_dim)
+        self.geometry_norm = nn.LayerNorm(latent_dim)
+
+    @staticmethod
+    def _build_unit_directions(spatial_dim: int) -> Tensor:
+        if spatial_dim == 2:
+            angles = torch.linspace(0.0, 2.0 * pi, steps=9, dtype=torch.float32)[:-1]
+            return torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+
+        phi = 0.5 * (1.0 + sqrt(5.0))
+        directions = torch.tensor([
+            [0.0, 1.0, phi],
+            [0.0, 1.0, -phi],
+            [0.0, -1.0, phi],
+            [0.0, -1.0, -phi],
+            [1.0, phi, 0.0],
+            [1.0, -phi, 0.0],
+            [-1.0, phi, 0.0],
+            [-1.0, -phi, 0.0],
+            [phi, 0.0, 1.0],
+            [phi, 0.0, -1.0],
+            [-phi, 0.0, 1.0],
+            [-phi, 0.0, -1.0],
+        ], dtype=torch.float32)
+        return F.normalize(directions, dim=-1)
+
+    def _boundary_geometry(self, coords: Tensor) -> Tensor:
+        centered_coords = coords - coords.mean(dim=1, keepdim=True)
+        radial_distance = torch.sqrt(centered_coords.square().sum(dim=-1, keepdim=True).clamp_min(1e-12))
+
+        projections = torch.einsum("bnd,kd->bnk", coords, self.unit_directions)
+        proj_max = projections.amax(dim=1, keepdim=True)
+        proj_min = projections.amin(dim=1, keepdim=True)
+        support_span = (proj_max - proj_min).clamp_min(1e-6)
+
+        dist_max = (proj_max - projections).clamp_min(0.0) / support_span
+        dist_min = (projections - proj_min).clamp_min(0.0) / support_span
+        directional_distance = torch.minimum(dist_max, dist_min)
+
+        pair_distance = torch.cat([dist_max, dist_min], dim=-1)
+        nearest_index = pair_distance.argmin(dim=-1)
+        num_dirs = self.unit_directions.shape[0]
+        dir_index = nearest_index.remainder(num_dirs)
+        gathered_dirs = self.unit_directions.index_select(0, dir_index.reshape(-1))
+        boundary_normals = gathered_dirs.view(*dir_index.shape, self.spatial_dim)
+
+        sign = coords.new_full((*dir_index.shape, 1), -1.0)
+        sign = torch.where((nearest_index < num_dirs).unsqueeze(-1), -sign, sign)
+        boundary_normals = sign * boundary_normals
+
+        nearest_distance = pair_distance.amin(dim=-1, keepdim=True)
+        boundary_proximity = torch.exp(-4.0 * nearest_distance)
+
+        return torch.cat(
+            [coords, centered_coords, radial_distance, directional_distance, boundary_proximity, boundary_normals],
+            dim=-1,
+        )
+
+    def forward(self, inputs: Tensor, coords: Tensor, t_norm: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        """
+        Build node tokens and geometry tokens.
+
+        Args:
+            inputs (Tensor): Input node features. (B, N, C_IN).
+            coords (Tensor): Node coordinates. (B, N, D).
+            t_norm (Optional[Tensor]): Normalized rollout time. (B,).
+
+        Returns:
+            Tuple[Tensor, Tensor]: Node tokens. (B, N, C). Geometry tokens. (B, N, C_LATENT).
+        """
+        B, N, _ = coords.shape
+        hidden_dtype = self.node_proj.weight.dtype
+
+        inputs = inputs.to(dtype=hidden_dtype)
+        coords = coords.to(dtype=hidden_dtype)
+        geometry_features = self._boundary_geometry(coords)
+
+        if self.time_encoder is None:
+            time_features = None
+        else:
+            if t_norm is None:
+                t_norm = torch.zeros(B, device=coords.device, dtype=hidden_dtype)
+            else:
+                t_norm = t_norm.to(device=coords.device, dtype=hidden_dtype)
+            time_features = self.time_encoder(t_norm, N).to(dtype=hidden_dtype)
+
+        components = [inputs, geometry_features]
+        if time_features is not None:
+            components.append(time_features)
+
+        node_tokens = self.node_norm(self.node_proj(torch.cat(components, dim=-1)))
+        geometry_tokens = self.geometry_norm(self.geometry_proj(geometry_features))
+        return node_tokens, geometry_tokens
+
+
+# ============================================================
+# Slice Blocks
+# ============================================================
+
+
+class SliceWriter(nn.Module):
+    """
+    Shared-basis soft slice writer for node tokens.
+    """
+
+    def __init__(self, width: int, latent_dim: int, num_slices: int) -> None:
+        """
+        Initialize the slice writer.
+
+        Args:
+            width (int): Node token width.
+            latent_dim (int): Shared bottleneck width.
+            num_slices (int): Number of soft slices.
+        """
+        super().__init__()
+        self.width = width
+        self.latent_dim = latent_dim
         self.num_slices = num_slices
-        self.head_dim = hidden_dim // num_heads
 
-        self.assignment_proj = nn.Linear(hidden_dim, num_slices)
-        self.query_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.key_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.value_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.shared_proj = nn.Linear(width, latent_dim)
+        self.feature_proj = nn.Linear(latent_dim, width)
+        self.assignment_proj = nn.Linear(2 * latent_dim, num_slices)
 
         nn.init.orthogonal_(self.assignment_proj.weight)
 
-    def _reshape_heads(self, x: Tensor) -> Tensor:
-        batch_size, num_tokens, _ = x.shape
-        x = x.view(batch_size, num_tokens, self.num_heads, self.head_dim)
-        return x.permute(0, 2, 1, 3).contiguous()
-
-    def _merge_heads(self, x: Tensor) -> Tensor:
-        batch_size, _, num_tokens, _ = x.shape
-        x = x.permute(0, 2, 1, 3).contiguous()
-        return x.view(batch_size, num_tokens, self.hidden_dim)
-
-    def _linear_attention(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+    def forward(self, node_tokens: Tensor, geometry_tokens: Tensor) -> Tuple[Tensor, Tensor]:
         """
-        Apply linear attention in the compressed slice space.
+        Aggregate node tokens into shared-assignment slice tokens.
 
         Args:
-            query (Tensor): Slice queries. (B, H, S, D).
-            key (Tensor): Slice keys. (B, H, S, D).
-            value (Tensor): Slice values. (B, H, S, D).
+            node_tokens (Tensor): Node tokens. (B, N, C).
+            geometry_tokens (Tensor): Geometry tokens. (B, N, C_LATENT).
 
         Returns:
-            Tensor: Updated slice tokens. (B, H, S, D).
+            Tuple[Tensor, Tensor]: Slice tokens. (B, S, C). Slice weights. (B, N, S).
         """
-        query = F.elu(query, alpha=1.0) + 1.0
-        key = F.elu(key, alpha=1.0) + 1.0
+        shared_tokens = self.shared_proj(node_tokens)
+        feature_tokens = self.feature_proj(shared_tokens)
+        slice_logits = self.assignment_proj(torch.cat([shared_tokens, geometry_tokens], dim=-1))
+        slice_weights = torch.softmax(slice_logits, dim=-1)
 
-        key_value = torch.einsum("bhsd,bhse->bhde", key, value)
-        key_sum = key.sum(dim=2)
-        denom = torch.einsum("bhsd,bhd->bhs", query, key_sum).unsqueeze(-1).clamp_min(1e-6)
-        numer = torch.einsum("bhsd,bhde->bhse", query, key_value)
-        return numer / denom
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Apply slice attention with shared slice assignment and linear slice mixing.
-
-        Args:
-            x (Tensor): Input node tokens. (B, N, H).
-
-        Returns:
-            Tensor: Updated node tokens. (B, N, H).
-        """
-        slice_weights = torch.softmax(self.assignment_proj(x), dim=-1)
-        slice_tokens = torch.einsum("bns,bnc->bsc", slice_weights, x)
-        slice_norm = slice_weights.sum(dim=1).unsqueeze(-1).clamp_min(1e-6)
+        slice_tokens = torch.einsum("bns,bnc->bsc", slice_weights, feature_tokens)
+        slice_norm = slice_weights.sum(dim=1, keepdim=False).unsqueeze(-1).clamp_min(1e-6)
         slice_tokens = slice_tokens / slice_norm
-
-        query = self._reshape_heads(self.query_proj(slice_tokens))
-        key = self._reshape_heads(self.key_proj(slice_tokens))
-        value = self._reshape_heads(self.value_proj(slice_tokens))
-
-        out_slice = self._merge_heads(self._linear_attention(query, key, value))
-        out = torch.einsum("bns,bsc->bnc", slice_weights, out_slice)
-        return self.out_proj(out)
+        return slice_tokens, slice_weights
 
 
-class FeedForward(nn.Module):
+class LatentTransition(nn.Module):
     """
-    Token-wise feed-forward network used inside HyperFlow blocks.
+    Anchor-coupled latent state transition for slice tokens.
     """
 
-    def __init__(self, hidden_dim: int, ffn_ratio: float = 4.0) -> None:
+    def __init__(self, width: int, latent_dim: int, num_anchors: int) -> None:
         """
-        Initialize the feed-forward network.
+        Initialize the latent transition module.
 
         Args:
-            hidden_dim (int): Hidden token width.
-            ffn_ratio (float): Expansion ratio of the intermediate hidden layer.
+            width (int): Slice token width.
+            latent_dim (int): Latent state width.
+            num_anchors (int): Number of anchor states.
         """
         super().__init__()
-        inner_dim = max(1, int(round(hidden_dim * ffn_ratio)))
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim, inner_dim),
-            nn.GELU(),
-            nn.Linear(inner_dim, hidden_dim),
-        )
+        self.width = width
+        self.latent_dim = latent_dim
+        self.num_anchors = num_anchors
 
-    def forward(self, x: Tensor) -> Tensor:
+        self.down_proj = nn.Linear(width, latent_dim)
+        self.down_norm = nn.LayerNorm(latent_dim)
+        self.anchor_proj = nn.Linear(latent_dim, num_anchors)
+        self.self_proj = nn.Linear(latent_dim, latent_dim, bias=False)
+        self.context_proj = nn.Linear(latent_dim, latent_dim, bias=False)
+        self.out_norm = nn.LayerNorm(latent_dim)
+        self.up_proj = nn.Linear(latent_dim, width)
+
+    def forward(self, slice_tokens: Tensor) -> Tensor:
         """
-        Apply the feed-forward network on token features.
+        Update slice tokens through low-rank latent dynamics.
 
         Args:
-            x (Tensor): Input tokens. (B, L, H).
+            slice_tokens (Tensor): Slice tokens. (B, S, C).
 
         Returns:
-            Tensor: Output tokens. (B, L, H).
+            Tensor: Updated slice tokens. (B, S, C).
         """
-        return self.net(x)
+        latent_states = self.down_norm(self.down_proj(slice_tokens))
+        anchor_logits = self.anchor_proj(latent_states)
+        anchor_weights = torch.softmax(anchor_logits, dim=-1)
+
+        anchor_states = torch.einsum("bsa,bsd->bad", anchor_weights, latent_states)
+        anchor_norm = anchor_weights.sum(dim=1, keepdim=False).unsqueeze(-1).clamp_min(1e-6)
+        anchor_states = anchor_states / anchor_norm
+
+        latent_context = torch.einsum("bsa,bad->bsd", anchor_weights, anchor_states)
+        updated_latent_states = latent_states + F.gelu(
+            self.self_proj(latent_states) + self.context_proj(latent_context)
+        )
+        return self.up_proj(self.out_norm(updated_latent_states))
+
+
+class SliceReader(nn.Module):
+    """
+    Shared-assignment slice reader for mapping slice states back to nodes.
+    """
+
+    def forward(self, slice_tokens: Tensor, slice_weights: Tensor) -> Tensor:
+        """
+        Read updated slice states back to node tokens.
+
+        Args:
+            slice_tokens (Tensor): Slice tokens. (B, S, C).
+            slice_weights (Tensor): Slice weights. (B, N, S).
+
+        Returns:
+            Tensor: Node updates. (B, N, C).
+        """
+        return torch.einsum("bns,bsc->bnc", slice_weights, slice_tokens)
+
+
+class ChannelMixer(nn.Module):
+    """
+    Low-rank GLU channel mixer for node tokens.
+    """
+
+    def __init__(self, width: int, latent_dim: int) -> None:
+        """
+        Initialize the channel mixer.
+
+        Args:
+            width (int): Node token width.
+            latent_dim (int): Low-rank bottleneck width.
+        """
+        super().__init__()
+        self.width = width
+        self.latent_dim = latent_dim
+
+        self.in_proj = nn.Linear(width, 2 * latent_dim)
+        self.out_proj = nn.Linear(latent_dim, width)
+
+    def forward(self, node_tokens: Tensor) -> Tensor:
+        """
+        Mix token channels through a low-rank GLU.
+
+        Args:
+            node_tokens (Tensor): Node tokens. (B, N, C).
+
+        Returns:
+            Tensor: Mixed node tokens. (B, N, C).
+        """
+        value, gate = self.in_proj(node_tokens).chunk(2, dim=-1)
+        return self.out_proj(F.gelu(value) * torch.sigmoid(gate))
 
 
 class HyperFlowBlock(nn.Module):
     """
-    Pre-norm slice-attention block for irregular mesh dynamics.
+    Shared recurrent slice block for irregular mesh dynamics.
     """
 
-    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, ffn_ratio: float) -> None:
+    def __init__(self, width: int, latent_dim: int, num_slices: int, num_anchors: int) -> None:
         """
-        Initialize one HyperFlow block.
+        Initialize the shared recurrent block.
 
         Args:
-            hidden_dim (int): Hidden token width.
-            num_heads (int): Number of attention heads.
-            num_slices (int): Number of slice tokens.
-            ffn_ratio (float): Expansion ratio of the feed-forward network.
+            width (int): Node token width.
+            latent_dim (int): Latent bottleneck width.
+            num_slices (int): Number of soft slices.
+            num_anchors (int): Number of anchor states.
         """
         super().__init__()
-        self.attn_norm = nn.LayerNorm(hidden_dim)
-        self.attn = SliceAttention(hidden_dim, num_heads, num_slices)
-        self.ffn_norm = nn.LayerNorm(hidden_dim)
-        self.ffn = FeedForward(hidden_dim, ffn_ratio=ffn_ratio)
+        self.slice_norm = nn.LayerNorm(width)
+        self.slice_writer = SliceWriter(width, latent_dim, num_slices)
+        self.latent_transition = LatentTransition(width, latent_dim, num_anchors)
+        self.slice_reader = SliceReader()
+        self.channel_norm = nn.LayerNorm(width)
+        self.channel_mixer = ChannelMixer(width, latent_dim)
 
-    def forward(self, node_tokens: Tensor) -> Tensor:
+    def forward(self, node_tokens: Tensor, geometry_tokens: Tensor) -> Tensor:
         """
-        Update node tokens with slice attention and feed-forward residual blocks.
+        Refine node tokens through one shared recurrent update.
 
         Args:
-            node_tokens (Tensor): Node tokens. (B, N, H).
+            node_tokens (Tensor): Node tokens. (B, N, C).
+            geometry_tokens (Tensor): Geometry tokens. (B, N, C_LATENT).
 
         Returns:
-            Tensor: Updated node tokens. (B, N, H).
+            Tensor: Refined node tokens. (B, N, C).
         """
-        node_tokens = node_tokens + self.attn(self.attn_norm(node_tokens))
-        node_tokens = node_tokens + self.ffn(self.ffn_norm(node_tokens))
+        slice_tokens, slice_weights = self.slice_writer(self.slice_norm(node_tokens), geometry_tokens)
+        node_tokens = node_tokens + self.slice_reader(self.latent_transition(slice_tokens), slice_weights)
+        node_tokens = node_tokens + self.channel_mixer(self.channel_norm(node_tokens))
         return node_tokens
 
 
@@ -277,7 +393,7 @@ class HyperFlowBlock(nn.Module):
 
 class HyperFlowNet(nn.Module):
     """
-    Spatio-temporal slice operator for autoregressive flow prediction on irregular meshes.
+    Recurrent slice-state operator for autoregressive flow prediction on irregular meshes.
     """
 
     def __init__(
@@ -286,13 +402,10 @@ class HyperFlowNet(nn.Module):
         out_channels: int,
         spatial_dim: int,
         width: int = 128,
-        depth: int = 4,
-        num_slices: int = 32,
-        num_heads: int = 8,
-        ffn_ratio: float = 4.0,
-        use_spatial_encoding: bool = True,
-        use_temporal_encoding: bool = True,
-        coords_features: int = 8,
+        depth: int = 6,
+        num_slices: int = 24,
+        latent_dim: int = 32,
+        num_anchors: int = 8,
         time_features: int = 4,
         freq_base: int = 1000,
     ) -> None:
@@ -303,16 +416,13 @@ class HyperFlowNet(nn.Module):
             in_channels (int): Number of node input channels.
             out_channels (int): Number of node output channels.
             spatial_dim (int): Spatial coordinate dimension.
-            width (int): Hidden token width.
-            depth (int): Number of stacked HyperFlow blocks.
-            num_slices (int): Number of slice tokens used by the slice operator.
-            num_heads (int): Number of attention heads.
-            ffn_ratio (float): Expansion ratio of the feed-forward network.
-            use_spatial_encoding (bool): Whether to encode coordinates before concatenation.
-            use_temporal_encoding (bool): Whether to append a sinusoidal time embedding.
-            coords_features (int): Number of learned spatial encoding features.
+            width (int): Node token width.
+            depth (int): Number of recurrent refinement steps.
+            num_slices (int): Number of soft slices.
+            latent_dim (int): Latent state width.
+            num_anchors (int): Number of anchor states.
             time_features (int): Number of temporal sinusoidal frequency pairs.
-            freq_base (int): Reference time scale used by the temporal encoder.
+            freq_base (int): Base for temporal frequencies.
         """
         super().__init__()
 
@@ -320,34 +430,20 @@ class HyperFlowNet(nn.Module):
         self.out_channels = out_channels
         self.spatial_dim = spatial_dim
         self.width = width
+        self.depth = depth
         self.num_slices = num_slices
+        self.latent_dim = latent_dim
+        self.num_anchors = num_anchors
 
-        if use_spatial_encoding:
-            self.spatial_encoder = SpatialEncoder(
-                spatial_dim=spatial_dim,
-                coords_features=coords_features,
-            )
-            spatial_width = self.spatial_encoder.out_dim
-        else:
-            self.spatial_encoder = None
-            spatial_width = spatial_dim
-
-        if use_temporal_encoding and time_features > 0:
-            self.time_encoder = TemporalEncoder(time_features=time_features, freq_base=freq_base)
-            time_width = self.time_encoder.out_dim
-        else:
-            self.time_encoder = None
-            time_width = 0
-
-        embed_in = in_channels + spatial_width + time_width
-        self.input_embed = nn.Linear(embed_in, width)
-        self.input_norm = nn.LayerNorm(width)
-
-        self.blocks = nn.ModuleList([
-            HyperFlowBlock(width, num_heads, num_slices, ffn_ratio=ffn_ratio)
-            for _ in range(depth)
-        ])
-
+        self.node_stem = NodeStem(
+            in_channels=in_channels,
+            spatial_dim=spatial_dim,
+            width=width,
+            latent_dim=latent_dim,
+            time_features=time_features,
+            freq_base=freq_base,
+        )
+        self.block = HyperFlowBlock(width, latent_dim, num_slices, num_anchors)
         self.output_norm = nn.LayerNorm(width)
         self.output_head = nn.Linear(width, out_channels)
 
@@ -363,29 +459,10 @@ class HyperFlowNet(nn.Module):
         Returns:
             Tensor: Predicted next state. (B, N, C_OUT).
         """
-        batch_size, num_nodes, _ = coords.shape
-        hidden_dtype = self.input_embed.weight.dtype
+        node_tokens, geometry_tokens = self.node_stem(inputs, coords, t_norm=t_norm)
 
-        inputs = inputs.to(dtype=hidden_dtype)
-        coords = coords.to(dtype=hidden_dtype)
-
-        components = [inputs]
-        if self.spatial_encoder is not None:
-            components.append(self.spatial_encoder(coords).to(dtype=hidden_dtype))
-        else:
-            components.append(coords)
-
-        if self.time_encoder is not None:
-            if t_norm is None:
-                t_norm = torch.zeros(batch_size, device=coords.device, dtype=hidden_dtype)
-            else:
-                t_norm = t_norm.to(device=coords.device, dtype=hidden_dtype)
-            components.append(self.time_encoder(t_norm, num_nodes).to(dtype=hidden_dtype))
-
-        node_tokens = self.input_norm(self.input_embed(torch.cat(components, dim=-1)))
-
-        for block in self.blocks:
-            node_tokens = block(node_tokens)
+        for _ in range(self.depth):
+            node_tokens = self.block(node_tokens, geometry_tokens)
 
         return self.output_head(self.output_norm(node_tokens))
 

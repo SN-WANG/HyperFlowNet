@@ -166,10 +166,8 @@ def _build_model(args: argparse.Namespace) -> HyperFlowNet:
         width=args.width,
         depth=args.depth,
         num_slices=args.num_slices,
-        num_heads=args.num_heads,
-        use_spatial_encoding=args.use_spatial_encoding,
-        use_temporal_encoding=args.use_temporal_encoding,
-        coords_features=args.coords_features,
+        latent_dim=args.latent_dim,
+        num_anchors=args.num_anchors,
         time_features=args.time_features,
         freq_base=args.freq_base,
     )
@@ -205,9 +203,6 @@ def _build_trainer(
         rollout_patience=args.rollout_patience,
         noise_std_init=args.noise_std_init,
         noise_decay=args.noise_decay,
-        teacher_forcing_init=args.teacher_forcing_init,
-        teacher_forcing_decay=args.teacher_forcing_decay,
-        teacher_forcing_floor=args.teacher_forcing_floor,
         boundary_condition=boundary_condition,
         channel_weights=args.channel_weights,
         scalers=scalers,
@@ -276,21 +271,21 @@ def data_pipeline(
         train_samples,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=4,
         pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_samples,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=4,
         pin_memory=pin_memory,
     )
     test_loader = DataLoader(
         test_samples,
         batch_size=1,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=4,
         pin_memory=pin_memory,
     )
 
@@ -343,12 +338,8 @@ def probe_pipeline(
 
     torch.cuda.reset_peak_memory_stats(device)
 
-    loss = trainer.compute_rollout_loss(
-        batch=(seq_std, coords_norm, t0_norm, dt_norm),
-        rollout_steps=k,
-        teacher_forcing_ratio=0.0,
-        noise_std=0.0,
-    )
+    trainer.current_rollout_steps = k
+    loss = trainer.compute_loss((seq_std, coords_norm, t0_norm, dt_norm))
     loss.backward()
     trainer.optimizer.step()
 
