@@ -339,7 +339,8 @@ def probe_pipeline(
     torch.cuda.reset_peak_memory_stats(device)
 
     trainer.current_rollout_steps = k
-    loss = trainer.compute_loss((seq_std, coords_norm, t0_norm, dt_norm))
+    trainer.current_noise_std = 0.0
+    loss = trainer._compute_loss((seq_std, coords_norm, t0_norm, dt_norm))
     loss.backward()
     trainer.optimizer.step()
 
