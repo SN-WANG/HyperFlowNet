@@ -460,7 +460,7 @@ def inference_pipeline(
                 focus_channel_idx = args.channel_names.index("Vy")
             else:
                 focus_channel_idx = min(1, len(args.channel_names) - 1)
-            focus_bbox_rel = (0.74, 1.00, 0.00, 1.00) if args.spatial_dim == 2 else (0.74, 1.00, 0.00, 1.00, 0.00, 1.00)
+            focus_bbox_rel = (0.60, 1.00, 0.00, 1.00) if args.spatial_dim == 2 else (0.60, 1.00, 0.00, 1.00, 0.00, 1.00)
 
             visualizer.render_full(
                 gt=gt_seq,
