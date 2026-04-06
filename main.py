@@ -359,7 +359,7 @@ def probe_pipeline(
         f"{hue.y}device: {hue.b}{torch.cuda.get_device_name(device)}{hue.q} "
         f"({hue.m}{total / 1e9:.1f}{hue.q} GB)"
     )
-    logger.info(f"peak usage: {hue.m}{peak / 1e9:.2f}{hue.q} GB ({hue.m}{pct:.1f}{hue.q} %) -> {status}")
+    logger.info(f"{hue.y}peak usage: {hue.m}{peak / 1e9:.2f}{hue.q} GB ({hue.m}{pct:.1f}{hue.q} %) -> {status}")
     _log_pipeline_end("PROBE PIPELINE")
 
 
