@@ -487,7 +487,7 @@ def inference_pipeline(
             torch.save(pred_seq, run_dir / f"{case_name}_pred.pt")
 
             num_nodes = int(coords_raw.shape[0])
-            focus_channel_idx = len(args.channel_names) - 1
+            focus_channel_idx = 1
             focus_bbox_rel = (0.60, 1.00, 0.00, 1.00) if args.spatial_dim == 2 \
             else (0.60, 1.00, 0.00, 1.00, 0.00, 1.00)
 
