@@ -689,10 +689,20 @@ class FlowVis:
         channel_name = self.ch_names[focus_channel_idx]
 
         win_w, win_h = self._window_size(focus_points, num_cols=1, num_rows=3, focus=True)
-        plotter = pv.Plotter(shape=(3, 1), off_screen=True, window_size=(win_w, win_h))
+        plotter = pv.Plotter(
+            shape=(3, 1),
+            off_screen=True,
+            border=True,
+            border_color="#222222",
+            border_width=2.0,
+            window_size=(win_w, win_h),
+        )
 
-        col_titles = ["CFD Simulation", "HyperFlowNet", "Relative Error"]
-        footers = [f"nodes: {num_nodes:,}", f"params: {num_params:,}", f"accuracy: {acc:.2f}%"]
+        col_titles = [
+            f"CFD Simulation (nodes: {num_nodes:,})",
+            f"HyperFlowNet (params: {num_params:,})",
+            f"Relative Error (accuracy: {acc:.2f}%)",
+        ]
         sbar_titles = [channel_name, channel_name, "Relative Error (%)"]
         cmaps = [
             self._value_cmap(focus_channel_idx, value_clim),
@@ -715,7 +725,7 @@ class FlowVis:
                     sbar_title=sbar_titles[row_idx],
                     title=col_titles[row_idx],
                     corner=channel_name if row_idx == 0 else None,
-                    footer=footers[row_idx],
+                    footer=None,
                     points=focus_points,
                     focus=True,
                     cmap=cmaps[row_idx],
