@@ -48,7 +48,7 @@ def get_args() -> argparse.Namespace:
     data.add_argument(
         "--win_stride", type=int, default=1, help="Stride for sliding-window augmentation.")
     data.add_argument(
-        "--batch_size", type=int, default=10, help="Mini-batch size for training and validation.")
+        "--batch_size", type=int, default=8, help="Mini-batch size for training and validation.")
 
     # ============================================================
     # 3. Model
@@ -82,11 +82,11 @@ def get_args() -> argparse.Namespace:
 
     optim = parser.add_argument_group("Optimization")
     optim.add_argument(
-        "--lr", type=float, default=6e-4, help="Initial learning rate for AdamW.")
+        "--lr", type=float, default=5e-4, help="Initial learning rate for AdamW.")
     optim.add_argument(
         "--weight_decay", type=float, default=1e-4, help="L2 regularization coefficient for AdamW.")
     optim.add_argument(
-        "--max_epochs", type=int, default=240, help="Maximum training epochs.")
+        "--max_epochs", type=int, default=320, help="Maximum training epochs.")
     optim.add_argument(
         "--eta_min", type=float, default=1e-6, help="Minimum learning rate for cosine annealing.")
     optim.add_argument(
@@ -101,7 +101,7 @@ def get_args() -> argparse.Namespace:
         "--max_rollout_steps", type=int, default=12,
         help="Maximum autoregressive rollout steps.")
     curriculum.add_argument(
-        "--rollout_patience", type=int, default=18,
+        "--rollout_patience", type=int, default=24,
         help="Epochs between curriculum difficulty advances.")
     curriculum.add_argument(
         "--noise_std_init", type=float, default=0.01,
