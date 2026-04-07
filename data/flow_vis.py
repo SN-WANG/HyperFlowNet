@@ -8,6 +8,7 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 import pyvista as pv
+from matplotlib.colors import Colormap, LinearSegmentedColormap
 from torch import Tensor
 from tqdm.auto import tqdm
 
@@ -24,11 +25,26 @@ def _channel_role(ch_idx: int, spatial_dim: int) -> str:
     return "temperature"
 
 
+_FLUENT_SEQ = LinearSegmentedColormap.from_list(
+    "fluent_seq",
+    ["#0a2a88", "#005bff", "#00a7ff", "#00d68f", "#b8ef00", "#ffd100", "#ff7a00", "#c50000"],
+    N=256,
+)
+_FLUENT_DIV = LinearSegmentedColormap.from_list(
+    "fluent_div",
+    ["#0a2a88", "#005bff", "#00a7ff", "#00cf9a", "#b8ef00", "#ffd100", "#ff7a00", "#c50000"],
+    N=256,
+)
+_FLUENT_ERR = LinearSegmentedColormap.from_list(
+    "fluent_err",
+    ["#0c3b9e", "#0094ff", "#33d17a", "#d8ef00", "#ffd100", "#ff7a00", "#c50000"],
+    N=256,
+)
 _CMAP = {
-    "velocity": "RdBu_r",
-    "pressure": "viridis",
-    "temperature": "viridis",
-    "error": "Reds",
+    "velocity": _FLUENT_DIV,
+    "pressure": _FLUENT_SEQ,
+    "temperature": _FLUENT_SEQ,
+    "error": _FLUENT_ERR,
 }
 
 
@@ -73,8 +89,8 @@ class FlowVis:
         self.fps = fps
         self.window_width = window_width
         self.subplot_height = subplot_height
-        self.focus_width = max(2800, int(window_width * 0.9))
-        self.focus_height = max(900, int(subplot_height * 2.2))
+        self.focus_width = max(1200, int(window_width * 0.35))
+        self.focus_height = max(420, int(subplot_height * 1.20))
         self.relative_eps = relative_eps
         self.p_idx = spatial_dim
 
@@ -240,7 +256,7 @@ class FlowVis:
     # Scalar transforms
     # ============================================================
 
-    def _value_cmap(self, ch_idx: int, clim: Tuple[float, float]) -> str:
+    def _value_cmap(self, ch_idx: int, clim: Tuple[float, float]) -> Colormap:
         """
         Pick the scalar colormap of one physical channel.
 
@@ -249,11 +265,11 @@ class FlowVis:
             clim (Tuple[float, float]): Value range.
 
         Returns:
-            str: Colormap name.
+            Colormap: Colormap object.
         """
         role = _channel_role(ch_idx, self.spatial_dim)
         if role == "velocity" and clim[0] >= 0.0:
-            return "plasma"
+            return _FLUENT_SEQ
         return _CMAP[role]
 
     def _clim(self, data: np.ndarray) -> Tuple[float, float]:
@@ -427,7 +443,7 @@ class FlowVis:
         footer: str | None,
         points: np.ndarray,
         focus: bool = False,
-        cmap: str | None = None,
+        cmap: str | Colormap | None = None,
     ) -> pv.PolyData:
         """
         Attach one field renderer to the active subplot.
@@ -444,7 +460,7 @@ class FlowVis:
             footer (str | None): Bottom centered label.
             points (np.ndarray): Visible points. (N, 3).
             focus (bool): Whether this pane belongs to the focus layout.
-            cmap (str | None): Colormap override.
+            cmap (str | Colormap | None): Colormap override.
 
         Returns:
             pv.PolyData: The per-pane mesh handle.
@@ -672,8 +688,8 @@ class FlowVis:
         rel_clim = self._clim(rel_np[:, :, 0])
         channel_name = self.ch_names[focus_channel_idx]
 
-        win_w, win_h = self._window_size(focus_points, num_cols=3, num_rows=1, focus=True)
-        plotter = pv.Plotter(shape=(1, 3), off_screen=True, window_size=(win_w, win_h))
+        win_w, win_h = self._window_size(focus_points, num_cols=1, num_rows=3, focus=True)
+        plotter = pv.Plotter(shape=(3, 1), off_screen=True, window_size=(win_w, win_h))
 
         col_titles = ["CFD Simulation", "HyperFlowNet", "Relative Error"]
         footers = [f"nodes: {num_nodes:,}", f"params: {num_params:,}", f"accuracy: {acc:.2f}%"]
@@ -687,28 +703,28 @@ class FlowVis:
         clims = [value_clim, value_clim, rel_clim]
 
         panes: List[pv.PolyData] = []
-        for col_idx in range(3):
-            plotter.subplot(0, col_idx)
+        for row_idx in range(3):
+            plotter.subplot(row_idx, 0)
             panes.append(
                 self._draw(
                     plotter=plotter,
                     mesh=focus_mesh,
-                    scalars=arrays[col_idx][0],
+                    scalars=arrays[row_idx][0],
                     ch_idx=focus_channel_idx,
-                    clim=clims[col_idx],
-                    sbar_title=sbar_titles[col_idx],
-                    title=col_titles[col_idx],
-                    corner=channel_name if col_idx == 0 else None,
-                    footer=footers[col_idx],
+                    clim=clims[row_idx],
+                    sbar_title=sbar_titles[row_idx],
+                    title=col_titles[row_idx],
+                    corner=channel_name if row_idx == 0 else None,
+                    footer=footers[row_idx],
                     points=focus_points,
                     focus=True,
-                    cmap=cmaps[col_idx],
+                    cmap=cmaps[row_idx],
                 )
             )
 
         def _update(step_idx: int) -> None:
-            for col_idx, pane in enumerate(panes):
-                pane.point_data["scalar"] = arrays[col_idx][step_idx].astype(np.float32)
+            for row_idx, pane in enumerate(panes):
+                pane.point_data["scalar"] = arrays[row_idx][step_idx].astype(np.float32)
 
         out_path = self.output_dir / f"{case_name}_focus_{channel_name.lower()}.mp4"
         self._mp4(plotter, _update, seq_len, out_path, desc=f"Rendering {case_name} focus")
