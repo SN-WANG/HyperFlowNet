@@ -1,7 +1,7 @@
 # HyperFlowNet rollout trainer based on BaseTrainer
 # Author: Shengning Wang
 
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 import torch
 from torch import Tensor, nn
@@ -14,28 +14,22 @@ from utils.hue_logger import hue, logger
 
 class RolloutCriterion(nn.Module):
     """
-    Channel-weighted NMSE criterion for one rollout step.
+    Single-channel NMSE criterion for one rollout step.
     """
 
-    def __init__(self, channel_weights: Optional[Sequence[float]] = None, eps: float = 1e-8) -> None:
+    def __init__(self, eps: float = 1e-8) -> None:
         """
         Initialize the rollout criterion.
 
         Args:
-            channel_weights (Optional[Sequence[float]]): Per-channel NMSE weights.
             eps (float): Small constant in the NMSE denominator.
         """
         super().__init__()
         self.eps = eps
 
-        if channel_weights is None:
-            self.channel_weights = None
-        else:
-            self.register_buffer("channel_weights", torch.tensor(channel_weights, dtype=torch.float32))
-
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
         """
-        Compute channel-weighted NMSE.
+        Compute single-channel NMSE.
 
         Args:
             pred (Tensor): Predicted state. (B, N, C).
@@ -47,16 +41,9 @@ class RolloutCriterion(nn.Module):
         pred = pred.float()
         target = target.float()
 
-        C = pred.shape[-1]
-        sq_err = (target - pred).square().reshape(-1, C).sum(dim=0)
-        sq_ref = target.square().reshape(-1, C).sum(dim=0).clamp_min(self.eps)
-        nmse = sq_err / sq_ref
-
-        if self.channel_weights is None:
-            return nmse.mean()
-
-        weights = self.channel_weights.to(device=pred.device, dtype=pred.dtype)
-        return (nmse * weights).sum() / weights.sum()
+        sq_err = (target - pred).square().sum()
+        sq_ref = target.square().sum().clamp_min(self.eps)
+        return sq_err / sq_ref
 
 
 class HyperFlowTrainer(BaseTrainer):
@@ -68,13 +55,13 @@ class HyperFlowTrainer(BaseTrainer):
         self,
         model: nn.Module,
         lr: float = 5e-4,
-        max_epochs: int = 320,
+        max_epochs: int = 560,
         weight_decay: float = 1e-4,
         eta_min: float = 1e-6,
         max_rollout_steps: int = 12,
-        rollout_patience: int = 24,
+        rollout_patience: int = 55,
         noise_std_init: float = 0.01,
-        noise_decay: float = 0.75,
+        noise_decay: float = 0.70,
         boundary_condition: Optional[Any] = None,
         **kwargs,
     ) -> None:
@@ -105,8 +92,7 @@ class HyperFlowTrainer(BaseTrainer):
             scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=eta_min)
 
         if criterion is None:
-            channel_weights = kwargs.pop("channel_weights", None)
-            criterion = RolloutCriterion(channel_weights=channel_weights)
+            criterion = RolloutCriterion()
 
         super().__init__(
             model=model,
@@ -161,7 +147,7 @@ class HyperFlowTrainer(BaseTrainer):
         Compute weighted rollout loss with step-wise BPTT.
 
         Args:
-            batch (Any): Batch tuple `(seq, coords, t0_norm, dt_norm)`.
+            batch (Any): Batch tuple `(seq, coords, label, t0_norm, dt_norm)`.
 
         Returns:
             Tensor: Scalar rollout loss. ().
@@ -169,22 +155,27 @@ class HyperFlowTrainer(BaseTrainer):
         rollout_steps = self.current_rollout_steps
         noise_std = self.current_noise_std if self.model.training else 0.0
 
-        seq, coords, t0_norm, dt_norm = batch
+        seq, coords, label, t0_norm, dt_norm = batch
 
         num_steps = min(int(rollout_steps), seq.shape[1] - 1)
         input_state = seq[:, 0]
         t0_norm = t0_norm.to(device=input_state.device, dtype=input_state.dtype)
         step_dt_norm = dt_norm.to(device=input_state.device, dtype=input_state.dtype)
+        label = label.to(device=input_state.device, dtype=input_state.dtype)
+        if label.ndim == 1:
+            label = label.unsqueeze(-1)
+        label_nodes = label.unsqueeze(1).expand(-1, input_state.shape[1], -1)
 
         total_weight = num_steps * (num_steps + 1)
         loss = seq.new_tensor(0.0, dtype=torch.float32)
 
         for step_idx in range(num_steps):
-            step_input = input_state
+            step_state = input_state
             if self.model.training and noise_std > 0.0:
-                step_input = step_input + noise_std * torch.randn_like(step_input)
+                step_state = step_state + noise_std * torch.randn_like(step_state)
 
             step_t_norm = t0_norm + step_idx * step_dt_norm
+            step_input = torch.cat([step_state, label_nodes], dim=-1)
             pred_state = self.model(step_input, coords, t_norm=step_t_norm)
 
             if self.boundary_condition is not None:

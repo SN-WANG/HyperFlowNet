@@ -474,17 +474,19 @@ class HyperFlowNet(nn.Module):
         t0_norm: Optional[Tensor] = None,
         dt_norm: Optional[Tensor] = None,
         boundary_condition=None,
+        label: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Run autoregressive rollout for inference.
 
         Args:
-            inputs (Tensor): Initial rollout state. (B, N, C_IN).
+            inputs (Tensor): Initial rollout state. (B, N, C_OUT).
             coords (Tensor): Node coordinates. (B, N, D).
             steps (int): Number of rollout steps.
             t0_norm (Optional[Tensor]): Initial normalized time index. (B,).
             dt_norm (Optional[Tensor]): Normalized time increment per rollout step. (B,).
             boundary_condition: Optional boundary-condition object exposing an `enforce` method.
+            label (Optional[Tensor]): Broadcast label per sample. (B, C_LABEL).
 
         Returns:
             Tensor: Rollout sequence including the initial state. (B, T + 1, N, C_OUT).
@@ -503,12 +505,21 @@ class HyperFlowNet(nn.Module):
         else:
             dt_norm = dt_norm.to(device=device, dtype=input_state.dtype)
 
+        if label is not None:
+            label = label.to(device=device, dtype=input_state.dtype)
+            if label.ndim == 1:
+                label = label.unsqueeze(-1)
+
         preds: List[Tensor] = [inputs.cpu()]
 
         with torch.no_grad():
             for step_idx in tqdm(range(steps), desc="Predicting", leave=False, dynamic_ncols=True):
                 step_t_norm = t0_norm + step_idx * dt_norm
-                next_state = self(input_state, coords, t_norm=step_t_norm)
+                step_input = input_state
+                if label is not None:
+                    label_nodes = label.unsqueeze(1).expand(-1, input_state.shape[1], -1)
+                    step_input = torch.cat([step_input, label_nodes], dim=-1)
+                next_state = self(step_input, coords, t_norm=step_t_norm)
 
                 if boundary_condition is not None:
                     next_state = boundary_condition.enforce(next_state)

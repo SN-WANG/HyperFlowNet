@@ -86,11 +86,9 @@ def get_args() -> argparse.Namespace:
     optim.add_argument(
         "--weight_decay", type=float, default=1e-4, help="L2 regularization coefficient for AdamW.")
     optim.add_argument(
-        "--max_epochs", type=int, default=320, help="Maximum training epochs.")
+        "--max_epochs", type=int, default=560, help="Maximum training epochs.")
     optim.add_argument(
         "--eta_min", type=float, default=1e-6, help="Minimum learning rate for cosine annealing.")
-    optim.add_argument(
-        "--channel_weights", type=float, nargs="+", default=[1.0, 3.0, 1.0, 1.0], help="Per-channel NMSE weights.")
 
     # ============================================================
     # 5. Curriculum
@@ -101,13 +99,13 @@ def get_args() -> argparse.Namespace:
         "--max_rollout_steps", type=int, default=12,
         help="Maximum autoregressive rollout steps.")
     curriculum.add_argument(
-        "--rollout_patience", type=int, default=24,
+        "--rollout_patience", type=int, default=55,
         help="Epochs between curriculum difficulty advances.")
     curriculum.add_argument(
         "--noise_std_init", type=float, default=0.01,
         help="Initial std of Gaussian noise injected into rollout input.")
     curriculum.add_argument(
-        "--noise_decay", type=float, default=0.75,
+        "--noise_decay", type=float, default=0.70,
         help="Multiplicative decay for rollout noise.")
 
     return parser.parse_args()

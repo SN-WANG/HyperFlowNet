@@ -13,7 +13,6 @@ from tqdm.auto import tqdm
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 
-from utils.scaler import StandardScalerTensor
 from utils.hue_logger import hue, logger
 
 class BaseTrainer:
@@ -23,7 +22,7 @@ class BaseTrainer:
     """
 
     def __init__(self, model: nn.Module, lr: float = 1e-3, max_epochs: int = 100, patience: int = None,
-                 scalers: Optional[Dict[str, StandardScalerTensor]] = None,
+                 params: Optional[Dict[str, Any]] = None, scalers: Optional[Dict[str, Any]] = None,
                  output_dir: Optional[Union[str, Path]] = "./runs",
                  optimizer: Optional[Optimizer] = None, scheduler: Optional[_LRScheduler] = None,
                  criterion: Optional[nn.Module] = None, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
@@ -35,7 +34,8 @@ class BaseTrainer:
             lr (float): Initial learning rate for the optimizer, defaults to 1e-3.
             max_epochs (int): Maximum training epochs, defaults to 100.
             patience (int): Epochs to wait before early stopping if no improvement, defaults to max_epochs.
-            scalers (Optional[Dict[str, StandardScalerTensor]]): Dictionary of scalers to save.
+            params (Optional[Dict[str, Any]]): Auxiliary checkpoint parameters to save.
+            scalers (Optional[Dict[str, Any]]): Dictionary of scalers to save.
             output_dir (Union[str, Path]): Directory to save artifacts, defaults to "./runs".
             optimizer (Optional[Optimizer]): Optimizer instance, defaults to Adam.
             scheduler (Optional[_LRScheduler]): Learning rate scheduler, defaults to None.
@@ -45,6 +45,7 @@ class BaseTrainer:
         self.device = torch.device(device)
         self.model = model.to(self.device)
 
+        self.params = params
         self.scalers = scalers
 
         self.output_dir = Path(output_dir)
@@ -126,7 +127,7 @@ class BaseTrainer:
         """
         pass
 
-    def _save_checkpoint(self, val_loss: float, is_best: bool = False, extra_state: Dict = {}) -> None:
+    def _save_checkpoint(self, val_loss: float, is_best: bool = False, extra_state: Optional[Dict[str, Any]] = None) -> None:
         """
         Save the training state.
         """
@@ -135,8 +136,11 @@ class BaseTrainer:
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "val_loss": val_loss,
-            **extra_state
         }
+        if extra_state:
+            state.update(extra_state)
+        if self.params:
+            state["params"] = self.params
         if self.scalers:
             state["scaler_state_dict"] = {k: v.state_dict() for k, v in self.scalers.items()}
         if self.scheduler:

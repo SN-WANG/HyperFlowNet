@@ -80,8 +80,8 @@ class BoundaryCondition:
         self.enforce_channels = list(velocity_channels)
 
         # Compute BC values in standardized space: (0 - mean) / std
-        mean = feature_scaler.mean.squeeze()    # (C,)
-        std = feature_scaler.std.squeeze()      # (C,)
+        mean = feature_scaler.mean.reshape(-1)    # (C,)
+        std = feature_scaler.std.reshape(-1)      # (C,)
         num_channels = mean.shape[0]
         wall_vals = torch.zeros(num_channels)
         for ch in self.enforce_channels:

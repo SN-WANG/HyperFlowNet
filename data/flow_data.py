@@ -48,6 +48,7 @@ class FlowData(Dataset):
 
         self.seqs: List[Tensor] = []
         self.coords: List[Tensor] = []
+        self.labels: List[Tensor] = []
         self.t0_norm: List[float] = []
         self.dt_norm: List[float] = []
 
@@ -71,6 +72,7 @@ class FlowData(Dataset):
 
                 self.seqs.append(states_tensor)
                 self.coords.append(coords_tensor)
+                self.labels.append(self._parse_label(name))
 
                 T = states_tensor.shape[0]
                 self.t0_norm.append(0.0)
@@ -84,8 +86,8 @@ class FlowData(Dataset):
     def __len__(self) -> int:
         return len(self.seqs)
 
-    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, float, float]:
-        return self.seqs[idx], self.coords[idx], self.t0_norm[idx], self.dt_norm[idx]
+    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, Tensor, float, float]:
+        return self.seqs[idx], self.coords[idx], self.labels[idx], self.t0_norm[idx], self.dt_norm[idx]
 
     def get_stats(self) -> Tuple[Tensor, Tensor]:
         """Calculates mean and std across the feature dimension (C)."""
@@ -139,6 +141,22 @@ class FlowData(Dataset):
         torch.save(payload, save_path)
         return payload
 
+    @staticmethod
+    def _parse_label(case_name: str) -> Tensor:
+        """
+        Parse the scalar operating-condition label from one case name.
+
+        Args:
+            case_name (str): Case identifier such as case_4500.
+
+        Returns:
+            Tensor: Pressure-ratio label. (1,).
+        """
+        match = re.search(r"(\d+)$", case_name)
+        if match is None:
+            raise ValueError(f"unable to parse label from case name: {case_name}")
+        return torch.tensor([float(match.group(1))], dtype=torch.float32)
+
     def _subsample(self, states: Tensor, coords: Tensor) -> Tuple[Tensor, Tensor]:
         """Performs temporal and spatial downsampling via equidistant indexing."""
         max_t, max_n = self.limits
@@ -189,16 +207,17 @@ class FlowData(Dataset):
         """Applies vectorized sliding window slicing for temporal augmentation."""
         new_seqs: List[Tensor] = []
         new_coords: List[Tensor] = []
+        new_labels: List[Tensor] = []
         new_t0_norm: List[float] = []
         new_dt_norm: List[float] = []
 
         logger.info(f"augmenting dataset with {hue.m}{len(dataset)}{hue.q} cases...")
 
-        pbar = tqdm(zip(dataset.seqs, dataset.coords, dataset.t0_norm, dataset.dt_norm),
+        pbar = tqdm(zip(dataset.seqs, dataset.coords, dataset.labels, dataset.t0_norm, dataset.dt_norm),
                     total=len(dataset),
                     desc=f"[FlowData] data augmenting", leave=False, dynamic_ncols=True)
 
-        for seq, coord, _, _ in pbar:
+        for seq, coord, label, _, _ in pbar:
             if seq.shape[0] < win_len: continue
 
             T = seq.shape[0]
@@ -210,17 +229,19 @@ class FlowData(Dataset):
             for i in range(unfolded.shape[0]):
                 new_seqs.append(unfolded[i])
                 new_coords.append(coord)
+                new_labels.append(label)
                 new_t0_norm.append(i * win_stride * dt_norm)
                 new_dt_norm.append(dt_norm)
 
         # shuffle across all cases
-        combined = list(zip(new_seqs, new_coords, new_t0_norm, new_dt_norm))
+        combined = list(zip(new_seqs, new_coords, new_labels, new_t0_norm, new_dt_norm))
         rng = np.random.default_rng(seed=42)
         rng.shuffle(combined)
 
-        dataset.seqs, dataset.coords, dataset.t0_norm, dataset.dt_norm = zip(*combined)
+        dataset.seqs, dataset.coords, dataset.labels, dataset.t0_norm, dataset.dt_norm = zip(*combined)
         dataset.seqs = list(dataset.seqs)
         dataset.coords = list(dataset.coords)
+        dataset.labels = list(dataset.labels)
         dataset.t0_norm = list(dataset.t0_norm)
         dataset.dt_norm = list(dataset.dt_norm)
 
