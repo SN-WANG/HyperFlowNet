@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn import functional as F
 from tqdm.auto import tqdm
 
@@ -241,6 +242,61 @@ class SliceWriter(nn.Module):
         return slice_tokens, slice_weights
 
 
+class SliceSelfAttention(nn.Module):
+    """
+    Multi-head self-attention on compact slice tokens.
+    """
+
+    def __init__(self, dim: int, heads: int = 8, attn_dropout: float = 0.0) -> None:
+        """
+        Initialize the slice self-attention module.
+
+        Args:
+            dim (int): Slice-token width.
+            heads (int): Number of attention heads.
+            attn_dropout (float): Dropout probability applied inside SDPA.
+        """
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.attn_dropout = attn_dropout
+
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, slice_tokens: Tensor) -> Tensor:
+        """
+        Apply slice-token self-attention.
+
+        Args:
+            slice_tokens (Tensor): Slice tokens. (B, S, C).
+
+        Returns:
+            Tensor: Attended slice tokens. (B, S, C).
+        """
+        B, S, D = slice_tokens.shape
+        head_dim = D // self.heads
+
+        q, k, v = self.qkv(slice_tokens).chunk(3, dim=-1)
+        q = q.view(B, S, self.heads, head_dim).transpose(1, 2)
+        k = k.view(B, S, self.heads, head_dim).transpose(1, 2)
+        v = v.view(B, S, self.heads, head_dim).transpose(1, 2)
+
+        with sdpa_kernel(
+            [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
+            set_priority=True,
+        ):
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.attn_dropout if self.training else 0.0,
+            )
+
+        attn_out = attn_out.transpose(1, 2).reshape(B, S, D)
+        return self.out_proj(attn_out)
+
+
 class LatentTransition(nn.Module):
     """
     Anchor-coupled latent state transition for slice tokens.
@@ -351,7 +407,15 @@ class HyperFlowBlock(nn.Module):
     Shared recurrent slice block for irregular mesh dynamics.
     """
 
-    def __init__(self, width: int, latent_dim: int, num_slices: int, num_anchors: int) -> None:
+    def __init__(
+        self,
+        width: int,
+        latent_dim: int,
+        num_slices: int,
+        num_anchors: int,
+        num_heads: int,
+        attn_dropout: float,
+    ) -> None:
         """
         Initialize the shared recurrent block.
 
@@ -360,10 +424,14 @@ class HyperFlowBlock(nn.Module):
             latent_dim (int): Latent bottleneck width.
             num_slices (int): Number of soft slices.
             num_anchors (int): Number of anchor states.
+            num_heads (int): Number of slice-attention heads.
+            attn_dropout (float): Dropout probability inside slice attention.
         """
         super().__init__()
         self.slice_norm = nn.LayerNorm(width)
         self.slice_writer = SliceWriter(width, latent_dim, num_slices)
+        self.attn_norm = nn.LayerNorm(width)
+        self.slice_attn = SliceSelfAttention(width, heads=num_heads, attn_dropout=attn_dropout)
         self.latent_transition = LatentTransition(width, latent_dim, num_anchors)
         self.slice_reader = SliceReader()
         self.channel_norm = nn.LayerNorm(width)
@@ -381,7 +449,9 @@ class HyperFlowBlock(nn.Module):
             Tensor: Refined node tokens. (B, N, C).
         """
         slice_tokens, slice_weights = self.slice_writer(self.slice_norm(node_tokens), geometry_tokens)
-        node_tokens = node_tokens + self.slice_reader(self.latent_transition(slice_tokens), slice_weights)
+        slice_tokens = slice_tokens + self.slice_attn(self.attn_norm(slice_tokens))
+        slice_tokens = self.latent_transition(slice_tokens)
+        node_tokens = node_tokens + self.slice_reader(slice_tokens, slice_weights)
         node_tokens = node_tokens + self.channel_mixer(self.channel_norm(node_tokens))
         return node_tokens
 
@@ -402,12 +472,14 @@ class HyperFlowNet(nn.Module):
         out_channels: int,
         spatial_dim: int,
         width: int = 128,
-        depth: int = 6,
-        num_slices: int = 24,
+        depth: int = 4,
+        num_slices: int = 32,
         latent_dim: int = 32,
         num_anchors: int = 8,
+        num_heads: int = 8,
         time_features: int = 4,
         freq_base: int = 1000,
+        attn_dropout: float = 0.0,
     ) -> None:
         """
         Initialize the HyperFlowNet architecture.
@@ -421,8 +493,10 @@ class HyperFlowNet(nn.Module):
             num_slices (int): Number of soft slices.
             latent_dim (int): Latent state width.
             num_anchors (int): Number of anchor states.
+            num_heads (int): Number of slice-attention heads.
             time_features (int): Number of temporal sinusoidal frequency pairs.
             freq_base (int): Base for temporal frequencies.
+            attn_dropout (float): Dropout probability inside slice attention.
         """
         super().__init__()
 
@@ -434,6 +508,7 @@ class HyperFlowNet(nn.Module):
         self.num_slices = num_slices
         self.latent_dim = latent_dim
         self.num_anchors = num_anchors
+        self.num_heads = num_heads
 
         self.node_stem = NodeStem(
             in_channels=in_channels,
@@ -443,7 +518,7 @@ class HyperFlowNet(nn.Module):
             time_features=time_features,
             freq_base=freq_base,
         )
-        self.block = HyperFlowBlock(width, latent_dim, num_slices, num_anchors)
+        self.block = HyperFlowBlock(width, latent_dim, num_slices, num_anchors, num_heads, attn_dropout)
         self.output_norm = nn.LayerNorm(width)
         self.output_head = nn.Linear(width, out_channels)
 
@@ -473,8 +548,7 @@ class HyperFlowNet(nn.Module):
         steps: int,
         t0_norm: Optional[Tensor] = None,
         dt_norm: Optional[Tensor] = None,
-        boundary_condition=None,
-        label: Optional[Tensor] = None,
+        show_progress: bool = True,
     ) -> Tensor:
         """
         Run autoregressive rollout for inference.
@@ -485,8 +559,7 @@ class HyperFlowNet(nn.Module):
             steps (int): Number of rollout steps.
             t0_norm (Optional[Tensor]): Initial normalized time index. (B,).
             dt_norm (Optional[Tensor]): Normalized time increment per rollout step. (B,).
-            boundary_condition: Optional boundary-condition object exposing an `enforce` method.
-            label (Optional[Tensor]): Broadcast label per sample. (B, C_LABEL).
+            show_progress (bool): Whether to show the rollout progress bar.
 
         Returns:
             Tensor: Rollout sequence including the initial state. (B, T + 1, N, C_OUT).
@@ -505,25 +578,13 @@ class HyperFlowNet(nn.Module):
         else:
             dt_norm = dt_norm.to(device=device, dtype=input_state.dtype)
 
-        if label is not None:
-            label = label.to(device=device, dtype=input_state.dtype)
-            if label.ndim == 1:
-                label = label.unsqueeze(-1)
-
-        preds: List[Tensor] = [inputs.cpu()]
+        preds: List[Tensor] = [input_state.cpu()]
 
         with torch.no_grad():
-            for step_idx in tqdm(range(steps), desc="Predicting", leave=False, dynamic_ncols=True):
+            iterator = tqdm(range(steps), desc="Predicting", leave=False, dynamic_ncols=True, disable=not show_progress)
+            for step_idx in iterator:
                 step_t_norm = t0_norm + step_idx * dt_norm
-                step_input = input_state
-                if label is not None:
-                    label_nodes = label.unsqueeze(1).expand(-1, input_state.shape[1], -1)
-                    step_input = torch.cat([step_input, label_nodes], dim=-1)
-                next_state = self(step_input, coords, t_norm=step_t_norm)
-
-                if boundary_condition is not None:
-                    next_state = boundary_condition.enforce(next_state)
-
+                next_state = self(input_state, coords, t_norm=step_t_norm)
                 preds.append(next_state.cpu())
                 input_state = next_state
 
