@@ -208,9 +208,8 @@ def probe_pipeline(args: Any, train_loader: DataLoader) -> None:
 
     logger.info(
         f"{hue.y}probe config:{hue.q} "
-        f"channels={hue.b}{args.channel_names}{hue.q}, "
         f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, "
-        f"nodes={hue.m}{N}{hue.q}, channels_per_node={hue.m}{C}{hue.q}, "
+        f"nodes={hue.m}{N}{hue.q}, channels={hue.m}{C}{hue.q}, "
         f"max_rollout={hue.m}{trainer.current_rollout_steps}{hue.q}, "
         f"params={hue.m}{total_params}{hue.q}"
     )
