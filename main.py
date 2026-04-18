@@ -298,36 +298,30 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
     focus_channel_idx = channel_names.index("Vy") if "Vy" in channel_names else 1
     focus_bbox_rel = (0.60, 1.00, 0.00, 1.00) if args.spatial_dim == 2 else (0.60, 1.00, 0.00, 1.00, 0.00, 1.00)
 
-    for case_name, seq, coords, label, t0_norm, dt_norm in zip(
-        test_data.case_names,
+    for seq, coords, label in zip(
         test_data.seqs,
         test_data.coords,
         test_data.labels,
-        test_data.t0_norm,
-        test_data.dt_norm,
     ):
         gt_seq = seq.cpu()
         coords_raw = coords.cpu()
         label_raw = label.cpu()
+        label_name = str(int(label_raw.reshape(-1)[0].item()))
 
         init_state = initial_state_from_label(label_raw, coords_raw)
         init_state_std = state_scaler.transform(init_state.unsqueeze(0)).to(device)
         coords_norm = coord_scaler.transform(coords_raw.unsqueeze(0)).to(device)
 
-        t0_tensor = torch.tensor([t0_norm], dtype=gt_seq.dtype, device=device)
-        dt_tensor = torch.tensor([dt_norm], dtype=gt_seq.dtype, device=device)
         pred_std = model.predict(
             inputs=init_state_std,
             coords=coords_norm,
             steps=gt_seq.shape[0] - 1,
-            t0_norm=t0_tensor,
-            dt_norm=dt_tensor,
         )
         pred_seq = state_scaler.inverse_transform(pred_std).cpu().squeeze(0)
         case_metrics = metrics.compute(pred_seq, gt_seq)
-        metrics_bank[case_name] = case_metrics
+        metrics_bank[label_name] = case_metrics
 
-        torch.save(pred_seq, output_dir / f"{case_name}_pred.pt")
+        torch.save(pred_seq, output_dir / f"{label_name}_pred.pt")
 
         logs = []
         for channel_name in channel_names:
@@ -339,13 +333,13 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
                 f"R2={hue.m}{global_metrics['r2']:.4f}{hue.q}"
             )
 
-        logger.info(f"case {hue.b}{case_name}{hue.q} | " + " | ".join(logs))
+        logger.info(f"label {hue.b}{label_name}{hue.q} | " + " | ".join(logs))
 
         visualizer.render_full(
             gt=gt_seq,
             pred=pred_seq,
             coords=coords_raw,
-            case_name=case_name,
+            label=label_name,
             num_nodes=int(coords_raw.shape[0]),
             num_params=total_params,
         )
@@ -353,7 +347,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
             gt=gt_seq,
             pred=pred_seq,
             coords=coords_raw,
-            case_name=case_name,
+            label=label_name,
             num_nodes=int(coords_raw.shape[0]),
             num_params=total_params,
             focus_channel_idx=focus_channel_idx,

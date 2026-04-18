@@ -273,14 +273,7 @@ class HyperFlowNet(nn.Module):
             x = block(x)
         return self.proj(x)
 
-    def predict(
-        self,
-        inputs: Tensor,
-        coords: Tensor,
-        steps: int,
-        t0_norm: Optional[Tensor] = None,
-        dt_norm: Optional[Tensor] = None,
-    ) -> Tensor:
+    def predict(self, inputs: Tensor, coords: Tensor, steps: int) -> Tensor:
         """
         Run autoregressive rollout prediction.
 
@@ -288,8 +281,6 @@ class HyperFlowNet(nn.Module):
             inputs (Tensor): Initial rollout state. (B, N, C_IN).
             coords (Tensor): Node coordinates. (B, N, D).
             steps (int): Number of rollout steps.
-            t0_norm (Optional[Tensor]): Initial normalized time. (B,).
-            dt_norm (Optional[Tensor]): Normalized time increment. (B,).
 
         Returns:
             Tensor: Predicted sequence with the initial state. (B, T + 1, N, C_OUT).
@@ -298,22 +289,20 @@ class HyperFlowNet(nn.Module):
         current_state = inputs.to(device)
         coords = coords.to(device)
 
-        if t0_norm is None:
-            t0_norm = torch.zeros(current_state.shape[0], device=device, dtype=current_state.dtype)
-        else:
-            t0_norm = t0_norm.to(device=device, dtype=current_state.dtype)
-
-        if dt_norm is None:
-            dt_norm = torch.full((current_state.shape[0],), 1.0 / max(steps, 1), device=device, dtype=current_state.dtype)
-        else:
-            dt_norm = dt_norm.to(device=device, dtype=current_state.dtype)
-
         sequence: List[Tensor] = [current_state.cpu()]
 
         with torch.no_grad():
             iterator = tqdm(range(steps), desc="Predicting", leave=False, dynamic_ncols=True)
             for step_idx in iterator:
-                step_t_norm = t0_norm + step_idx * dt_norm if self.time_encoder is not None else None
+                if self.time_encoder is None:
+                    step_t_norm = None
+                else:
+                    step_t_norm = torch.full(
+                        (current_state.shape[0],),
+                        step_idx / max(steps, 1),
+                        device=device,
+                        dtype=current_state.dtype,
+                    )
                 next_state = self(current_state, coords, t_norm=step_t_norm)
                 sequence.append(next_state.cpu())
                 current_state = next_state

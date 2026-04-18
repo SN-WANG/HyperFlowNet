@@ -493,14 +493,14 @@ class FlowVis:
     # Public interface
     # ============================================================
 
-    def render_seq(self, sequence: Tensor, coords: Tensor, case_name: str) -> None:
+    def render_seq(self, sequence: Tensor, coords: Tensor, label: str) -> None:
         """
         Render one rollout with all channels stacked vertically.
 
         Args:
             sequence (Tensor): Flow sequence. (T, N, C).
             coords (Tensor): Node coordinates. (N, D).
-            case_name (str): Output case name.
+            label (str): Output label.
         """
         seq_np = sequence.detach().cpu().numpy()
         seq_len, _, num_channels = seq_np.shape
@@ -540,8 +540,8 @@ class FlowVis:
             for ch_idx, pane in enumerate(panes):
                 pane.point_data["scalar"] = seq_np[step_idx, :, ch_idx].astype(np.float32)
 
-        out_path = self.output_dir / f"{case_name}_seq.mp4"
-        self._mp4(plotter, _update, seq_len, out_path, desc=f"Rendering {case_name} sequence")
+        out_path = self.output_dir / f"{label}_seq.mp4"
+        self._mp4(plotter, _update, seq_len, out_path, desc=f"Rendering {label} sequence")
         logger.info(f"sequence video saved to {hue.g}{out_path}{hue.q}")
 
     def render_full(
@@ -549,7 +549,7 @@ class FlowVis:
         gt: Tensor,
         pred: Tensor,
         coords: Tensor,
-        case_name: str,
+        label: str,
         num_nodes: int,
         num_params: int,
     ) -> None:
@@ -560,7 +560,7 @@ class FlowVis:
             gt (Tensor): Ground truth. (T, N, C).
             pred (Tensor): Prediction. (T, N, C).
             coords (Tensor): Node coordinates. (N, D).
-            case_name (str): Output case name.
+            label (str): Output label.
             num_nodes (int): Total node count.
             num_params (int): Model parameter count.
         """
@@ -629,8 +629,8 @@ class FlowVis:
                 panes[ch_idx][1].point_data["scalar"] = pred_np[step_idx, :, ch_idx].astype(np.float32)
                 panes[ch_idx][2].point_data["scalar"] = rel_np[step_idx, :, ch_idx].astype(np.float32)
 
-        out_path = self.output_dir / f"{case_name}_full.mp4"
-        self._mp4(plotter, _update, seq_len, out_path, desc=f"Rendering {case_name} full")
+        out_path = self.output_dir / f"{label}_full.mp4"
+        self._mp4(plotter, _update, seq_len, out_path, desc=f"Rendering {label} full")
         logger.info(f"full video saved to {hue.g}{out_path}{hue.q}")
 
     def render_focus(
@@ -638,7 +638,7 @@ class FlowVis:
         gt: Tensor,
         pred: Tensor,
         coords: Tensor,
-        case_name: str,
+        label: str,
         num_nodes: int,
         num_params: int,
         focus_channel_idx: int = 1,
@@ -651,7 +651,7 @@ class FlowVis:
             gt (Tensor): Ground truth. (T, N, C).
             pred (Tensor): Prediction. (T, N, C).
             coords (Tensor): Node coordinates. (N, D).
-            case_name (str): Output case name.
+            label (str): Output label.
             num_nodes (int): Total node count.
             num_params (int): Model parameter count.
             focus_channel_idx (int): Visualized channel index.
@@ -736,6 +736,6 @@ class FlowVis:
             for row_idx, pane in enumerate(panes):
                 pane.point_data["scalar"] = arrays[row_idx][step_idx].astype(np.float32)
 
-        out_path = self.output_dir / f"{case_name}_focus_{channel_name.lower()}.mp4"
-        self._mp4(plotter, _update, seq_len, out_path, desc=f"Rendering {case_name} focus")
+        out_path = self.output_dir / f"{label}_focus_{channel_name.lower()}.mp4"
+        self._mp4(plotter, _update, seq_len, out_path, desc=f"Rendering {label} focus")
         logger.info(f"focus video saved to {hue.g}{out_path}{hue.q}")
