@@ -2,6 +2,8 @@
 # Author: Shengning Wang
 
 import json
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -162,13 +164,14 @@ def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
     return train_loader, val_loader, test_data
 
 
-def probe_pipeline(args: Any, train_loader: DataLoader) -> None:
+def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) -> None:
     """
     Execute one rollout step for peak GPU memory probing.
 
     Args:
         args (Any): Parsed command-line arguments.
         train_loader (DataLoader): Training loader.
+        val_loader (DataLoader): Validation loader.
     """
     logger.info(f"{hue.c}============================= [PROBE PIPELINE] START =============================={hue.q}")
 
@@ -194,6 +197,11 @@ def probe_pipeline(args: Any, train_loader: DataLoader) -> None:
     coords_norm = coords_norm.to(device)
     t0_norm = t0_norm.to(device)
     dt_norm = dt_norm.to(device)
+    val_seq_std, val_coords_norm, val_t0_norm, val_dt_norm = next(iter(val_loader))
+    val_seq_std = val_seq_std.to(device)
+    val_coords_norm = val_coords_norm.to(device)
+    val_t0_norm = val_t0_norm.to(device)
+    val_dt_norm = val_dt_norm.to(device)
 
     trainer.model.train()
     trainer.optimizer.zero_grad(set_to_none=True)
@@ -202,9 +210,27 @@ def probe_pipeline(args: Any, train_loader: DataLoader) -> None:
 
     B, T, N, C = seq_std.shape
     total_params = sum(p.numel() for p in trainer.model.parameters())
+    train_steps = len(train_loader)
+    torch.cuda.synchronize(device)
+    probe_start = time.perf_counter()
     loss = trainer._compute_loss((seq_std, coords_norm, t0_norm, dt_norm))
     loss.backward()
     trainer.optimizer.step()
+    torch.cuda.synchronize(device)
+    train_batch_time = time.perf_counter() - probe_start
+
+    val_steps = len(val_loader)
+    trainer.model.eval()
+    torch.cuda.synchronize(device)
+    probe_start = time.perf_counter()
+    with torch.no_grad():
+        trainer._compute_loss((val_seq_std, val_coords_norm, val_t0_norm, val_dt_norm))
+    torch.cuda.synchronize(device)
+    val_batch_time = time.perf_counter() - probe_start
+
+    rollout_sum = sum(min(1 + epoch // args.rollout_patience, trainer.current_rollout_steps) for epoch in range(args.max_epochs))
+    total_seconds = (train_batch_time * train_steps + val_batch_time * val_steps) * rollout_sum / trainer.current_rollout_steps
+    finish_at = datetime.now().astimezone() + timedelta(seconds=total_seconds)
 
     logger.info(
         f"{hue.y}probe config:{hue.q} "
@@ -226,6 +252,7 @@ def probe_pipeline(args: Any, train_loader: DataLoader) -> None:
 
     logger.info(f"{hue.y}device: {hue.b}{torch.cuda.get_device_name(device)}{hue.q} ({hue.m}{total / 1e9:.1f}{hue.q} GB)")
     logger.info(f"{hue.y}peak usage: {hue.m}{peak / 1e9:.2f}{hue.q} GB ({hue.m}{pct:.1f}{hue.q} %) -> {status}")
+    logger.info(f"{hue.y}train eta: {hue.m}{total_seconds / 3600.0:.1f}{hue.q} h -> {hue.b}{finish_at.strftime('%m-%d %H:%M')}{hue.q}")
     logger.info(f"{hue.g}============================== [PROBE PIPELINE] END ==============================={hue.q}")
 
 
@@ -366,7 +393,7 @@ if __name__ == "__main__":
     train_loader, val_loader, test_data = data_pipeline(args)
 
     if "probe" in args.mode:
-        probe_pipeline(args, train_loader)
+        probe_pipeline(args, train_loader, val_loader)
     if "train" in args.mode:
         train_pipeline(args, train_loader, val_loader)
     if "infer" in args.mode:
