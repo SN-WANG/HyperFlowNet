@@ -141,22 +141,6 @@ class FlowData(Dataset):
         torch.save(payload, save_path)
         return payload
 
-    @staticmethod
-    def _parse_label(case_name: str) -> Tensor:
-        """
-        Parse the scalar operating-condition label from one case name.
-
-        Args:
-            case_name (str): Case identifier such as case_4500.
-
-        Returns:
-            Tensor: Pressure-ratio label. (1,).
-        """
-        match = re.search(r"(\d+)$", case_name)
-        if match is None:
-            raise ValueError(f"unable to parse label from case name: {case_name}")
-        return torch.tensor([float(match.group(1))], dtype=torch.float32)
-
     def _subsample(self, states: Tensor, coords: Tensor) -> Tuple[Tensor, Tensor]:
         """Performs temporal and spatial downsampling via equidistant indexing."""
         max_t, max_n = self.limits
@@ -174,6 +158,22 @@ class FlowData(Dataset):
             coords = torch.index_select(coords, 0, indices)
 
         return states, coords
+
+    @staticmethod
+    def _parse_label(case_name: str) -> Tensor:
+        """
+        Parse the scalar operating-condition label from one case name.
+
+        Args:
+            case_name (str): Case identifier such as case_4500.
+
+        Returns:
+            Tensor: Pressure-ratio label. (1,).
+        """
+        match = re.search(r"(\d+)$", case_name)
+        if match is None:
+            raise ValueError(f"unable to parse label from case name: {case_name}")
+        return torch.tensor([float(match.group(1))], dtype=torch.float32)
 
     @staticmethod
     def discover_cases(data_dir: Union[str, Path] = "./dataset", prefix: str = "case") -> List[str]:

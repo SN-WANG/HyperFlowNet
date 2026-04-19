@@ -91,7 +91,7 @@ class HyperFlowTrainer(BaseTrainer):
             rollout_patience (int): Epochs between curriculum advances.
             noise_std_init (float): Initial Gaussian noise level.
             noise_decay (float): Multiplicative decay of rollout noise.
-            channel_weights (Optional[list[float]]): Optional per-channel NMSE weights.
+            channel_weights (Optional[list[float]]): Optional per-channel loss weights.
             **kwargs: Arguments forwarded to BaseTrainer.
         """
         optimizer = kwargs.pop("optimizer", None)
@@ -156,13 +156,13 @@ class HyperFlowTrainer(BaseTrainer):
         Compute weighted rollout NMSE with curriculum and noise injection.
 
         Args:
-            batch (Any): Batch tuple ``(seq, coords, t0_norm, dt_norm)``.
+            batch (Any): Batch tuple (seq, coords, t0_norm, dt_norm).
 
         Returns:
             Tensor: Scalar rollout loss. ().
         """
         seq, coords, t0_norm, dt_norm = batch
-        k = min(self.current_rollout_steps, seq.shape[1] - 1)
+        k = self.current_rollout_steps
         total_weight = k * (k + 1)
 
         input_state = seq[:, 0]

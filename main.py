@@ -1,4 +1,4 @@
-# Main script for HyperFlowNet training, inference, and probing
+# Main script for HyperFlowNet probing, training and inference
 # Author: Shengning Wang
 
 import json
@@ -8,33 +8,37 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import torch
+from torch import nn
 from torch.utils.data import DataLoader
 
 import config
+
 from data.flow_data import FlowData
 from data.flow_metrics import Metrics
 from data.flow_vis import FlowVis
 from data.initial_state import initial_state_from_label
+
 from models.hflownet import HyperFlowNet
 from training.hflow_trainer import HyperFlowTrainer
+
 from utils.hue_logger import hue, logger
-from utils.scaler import MinMaxScalerTensor, StandardScalerTensor
 from utils.seeder import seed_everything
+from utils.scaler import MinMaxScalerTensor, StandardScalerTensor
 
 
 def build_model(
     args: Any | None = None,
     model_args: Dict[str, Any] | None = None,
-) -> Tuple[HyperFlowNet, Dict[str, Any]]:
+) -> Tuple[nn.Module, Dict[str, Any]]:
     """
-    Build HyperFlowNet and return its constructor arguments.
+    Build model and return its constructor arguments.
 
     Args:
         args (Any | None): Parsed command-line arguments.
         model_args (Dict[str, Any] | None): Explicit model arguments.
 
     Returns:
-        Tuple[HyperFlowNet, Dict[str, Any]]: Model instance and model arguments.
+        Tuple[nn.Module, Dict[str, Any]]: Model instance and model arguments.
     """
     if model_args is None:
         model_args = {
@@ -57,22 +61,22 @@ def build_model(
 def build_trainer(
     args: Any,
     model: HyperFlowNet,
-    scalers: Dict[str, object],
     params: Dict[str, Any],
+    scalers: Dict[str, object],
     output_dir: Path,
-) -> HyperFlowTrainer:
+) -> Any:
     """
-    Build the rollout trainer for HyperFlowNet.
+    Build trainer.
 
     Args:
         args (Any): Parsed command-line arguments.
         model (HyperFlowNet): HyperFlowNet model.
-        scalers (Dict[str, object]): Saved scaler objects.
         params (Dict[str, Any]): Checkpoint parameters.
+        scalers (Dict[str, object]): Saved scaler objects.
         output_dir (Path): Output directory.
 
     Returns:
-        HyperFlowTrainer: Configured trainer.
+        Any: Configured trainer.
     """
     return HyperFlowTrainer(
         model=model,
@@ -166,7 +170,7 @@ def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
 
 def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) -> None:
     """
-    Execute one rollout step for peak GPU memory probing.
+    Execute one rollout step for peak GPU memory and training eta probing.
 
     Args:
         args (Any): Parsed command-line arguments.
@@ -275,7 +279,7 @@ def train_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
     scalers = {"state_scaler": args.state_scaler, "coord_scaler": args.coord_scaler}
     total_params = sum(p.numel() for p in model.parameters())
 
-    logger.info(f"train joint model with {hue.m}{total_params}{hue.q} parameters")
+    logger.info(f"train model with {hue.m}{total_params}{hue.q} parameters")
 
     trainer = build_trainer(args, model, scalers, params, output_dir)
     trainer.fit(train_loader, val_loader)
@@ -319,7 +323,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
     metrics = Metrics(channel_names)
     metrics_bank = {}
 
-    focus_channel_idx = channel_names.index("Vy") if "Vy" in channel_names else 1
+    focus_channel_idx = channel_names.index("Vy")
     focus_bbox_rel = (0.60, 1.00, 0.00, 1.00) if args.spatial_dim == 2 else (0.60, 1.00, 0.00, 1.00, 0.00, 1.00)
 
     for seq, coords, label in zip(

@@ -298,12 +298,10 @@ class HyperFlowNet(nn.Module):
                     step_t_norm = None
                 else:
                     step_t_norm = torch.full(
-                        (current_state.shape[0],),
-                        step_idx / max(steps, 1),
-                        device=device,
-                        dtype=current_state.dtype,
+                        (current_state.shape[0],), step_idx / max(steps, 1),
+                        device=device, dtype=current_state.dtype,
                     )
-                next_state = self(current_state, coords, t_norm=step_t_norm)
+                next_state = self.forward(current_state, coords, t_norm=step_t_norm)
                 sequence.append(next_state.cpu())
                 current_state = next_state
 
