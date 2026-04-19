@@ -194,7 +194,7 @@ def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
     model, model_args = build_model(args=args)
     params = {"model_args": model_args, "channel_names": args.channel_names}
     scalers = {"state_scaler": args.state_scaler, "coord_scaler": args.coord_scaler}
-    trainer = build_trainer(args, model, scalers, params, output_dir)
+    trainer = build_trainer(args, model, params, scalers, output_dir)
 
     seq_std, coords_norm, t0_norm, dt_norm = next(iter(train_loader))
     seq_std = seq_std.to(device)
@@ -281,7 +281,7 @@ def train_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
 
     logger.info(f"train model with {hue.m}{total_params}{hue.q} parameters")
 
-    trainer = build_trainer(args, model, scalers, params, output_dir)
+    trainer = build_trainer(args, model, params, scalers, output_dir)
     trainer.fit(train_loader, val_loader)
 
     logger.info(f"{hue.g}============================== [TRAIN PIPELINE] END ==============================={hue.q}")

@@ -162,7 +162,7 @@ class HyperFlowTrainer(BaseTrainer):
             Tensor: Scalar rollout loss. ().
         """
         seq, coords, t0_norm, dt_norm = batch
-        k = self.current_rollout_steps
+        k = min(self.current_rollout_steps, seq.shape[1] - 1)
         total_weight = k * (k + 1)
 
         input_state = seq[:, 0]
