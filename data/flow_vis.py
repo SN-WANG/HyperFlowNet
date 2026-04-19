@@ -547,11 +547,11 @@ class FlowVis:
             "canvas_size": (1260, 1440),
             "box_size": (954, 365),
             "box_x": 153,
-            "box_y": (28, 508, 988),
-            "image_pos": ((189, 46), (189, 526), (189, 1006)),
+            "box_y": (34, 514, 994),
+            "image_pos": ((189, 52), (189, 532), (189, 1012)),
             "image_size": (882, 330),
-            "bar_pos": ((429, 396), (429, 877), (429, 1357)),
-            "bar_size": (402, 52),
+            "bar_pos": ((395, 402), (395, 883), (395, 1363)),
+            "bar_size": (470, 52),
             "title_y": (0, 480, 960),
         }
 
@@ -617,7 +617,7 @@ class FlowVis:
             Image.Image: RGBA colorbar image.
         """
         width, height = self._focus_layout()["bar_size"]
-        tick_font = self._focus_font(11)
+        tick_font = self._focus_font(10)
         label_font = self._focus_font(13)
         canvas = Image.new("RGBA", (width, height), (255, 255, 255, 0))
         draw = ImageDraw.Draw(canvas)
@@ -719,7 +719,7 @@ class FlowVis:
             canvas.paste(pane_image, layout["image_pos"][row_idx])
             canvas.paste(colorbars[row_idx], layout["bar_pos"][row_idx], colorbars[row_idx])
 
-        draw.text((171, 34), channel_name, fill=(16, 16, 16), font=corner_font)
+        draw.text((171, 40), channel_name, fill=(16, 16, 16), font=corner_font)
         return np.asarray(canvas, dtype=np.uint8)
 
     # ============================================================
