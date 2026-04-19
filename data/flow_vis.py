@@ -214,13 +214,14 @@ class FlowVis:
             mask &= points[:, dim] <= bounds[1, dim] + eps
         return mask
 
-    def _camera(self, plotter: pv.Plotter, points: np.ndarray) -> None:
+    def _camera(self, plotter: pv.Plotter, points: np.ndarray, focus: bool = False) -> None:
         """
         Set a stable view for one renderer.
 
         Args:
             plotter (pv.Plotter): Active plotter.
             points (np.ndarray): Visible point coordinates. (N, 3).
+            focus (bool): Whether this is the focused local layout.
         """
         if self.spatial_dim == 2:
             plotter.view_xy()
@@ -242,6 +243,8 @@ class FlowVis:
             scale_y = dy * (1.0 + pad_frac) * 0.5
             scale_x = dx * (1.0 + pad_frac) / (2.0 * vp_aspect)
             scale = max(scale_y, scale_x)
+            if focus:
+                scale *= 1.38
 
             plotter.camera.focal_point = (cx, cy, 0.0)
             plotter.camera.position = (cx, cy, 1.0)
@@ -349,14 +352,14 @@ class FlowVis:
         """Return scalar-bar layout arguments."""
         if focus:
             return {
-                "height": 0.08,
-                "width": 0.72,
-                "position_x": 0.14,
-                "position_y": 0.10,
+                "height": 0.055,
+                "width": 0.38,
+                "position_x": 0.31,
+                "position_y": 0.05,
                 "vertical": False,
                 "fmt": "%.2e",
-                "title_font_size": 14,
-                "label_font_size": 12,
+                "title_font_size": 13,
+                "label_font_size": 11,
             }
         return {
             "height": 0.06,
@@ -486,7 +489,7 @@ class FlowVis:
         if footer is not None:
             plotter.add_text(footer, position="lower_edge", font_size=18 if focus else 12)
 
-        self._camera(plotter, points)
+        self._camera(plotter, points, focus=focus)
         return pane
 
     # ============================================================
