@@ -8,6 +8,8 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 import pyvista as pv
+from PIL import Image, ImageDraw, ImageFont
+from matplotlib import font_manager
 from matplotlib.colors import Colormap, LinearSegmentedColormap
 from torch import Tensor
 from tqdm.auto import tqdm
@@ -93,6 +95,7 @@ class FlowVis:
         self.focus_height = max(420, int(subplot_height * 1.20))
         self.relative_eps = relative_eps
         self.p_idx = spatial_dim
+        self.font_path = font_manager.findfont("DejaVu Sans")
 
         pv.set_plot_theme(theme)
 
@@ -214,14 +217,13 @@ class FlowVis:
             mask &= points[:, dim] <= bounds[1, dim] + eps
         return mask
 
-    def _camera(self, plotter: pv.Plotter, points: np.ndarray, focus: bool = False) -> None:
+    def _camera(self, plotter: pv.Plotter, points: np.ndarray) -> None:
         """
         Set a stable view for one renderer.
 
         Args:
             plotter (pv.Plotter): Active plotter.
             points (np.ndarray): Visible point coordinates. (N, 3).
-            focus (bool): Whether this is the focused local layout.
         """
         if self.spatial_dim == 2:
             plotter.view_xy()
@@ -243,8 +245,6 @@ class FlowVis:
             scale_y = dy * (1.0 + pad_frac) * 0.5
             scale_x = dx * (1.0 + pad_frac) / (2.0 * vp_aspect)
             scale = max(scale_y, scale_x)
-            if focus:
-                scale *= 1.38
 
             plotter.camera.focal_point = (cx, cy, 0.0)
             plotter.camera.position = (cx, cy, 1.0)
@@ -348,19 +348,8 @@ class FlowVis:
         abs_gt = gt.abs().sum(dim=(0, 1)).clamp_min(self.relative_eps)
         return (1.0 - abs_diff / abs_gt) * 100.0
 
-    def _sbar_args(self, focus: bool = False) -> dict:
+    def _sbar_args(self) -> dict:
         """Return scalar-bar layout arguments."""
-        if focus:
-            return {
-                "height": 0.055,
-                "width": 0.38,
-                "position_x": 0.31,
-                "position_y": 0.05,
-                "vertical": False,
-                "fmt": "%.2e",
-                "title_font_size": 13,
-                "label_font_size": 11,
-            }
         return {
             "height": 0.06,
             "width": 0.60,
@@ -445,7 +434,6 @@ class FlowVis:
         corner: str | None,
         footer: str | None,
         points: np.ndarray,
-        focus: bool = False,
         cmap: str | Colormap | None = None,
     ) -> pv.PolyData:
         """
@@ -462,7 +450,6 @@ class FlowVis:
             corner (str | None): Upper-left label.
             footer (str | None): Bottom centered label.
             points (np.ndarray): Visible points. (N, 3).
-            focus (bool): Whether this pane belongs to the focus layout.
             cmap (str | Colormap | None): Colormap override.
 
         Returns:
@@ -475,7 +462,7 @@ class FlowVis:
             scalars="scalar",
             cmap=self._value_cmap(ch_idx, clim) if cmap is None else cmap,
             clim=clim,
-            scalar_bar_args={**self._sbar_args(focus), "title": sbar_title},
+            scalar_bar_args={**self._sbar_args(), "title": sbar_title},
         )
         if pane.n_cells > 0:
             plotter.add_mesh(pane, **add_kw)
@@ -483,14 +470,257 @@ class FlowVis:
             plotter.add_mesh(pane, **add_kw, point_size=5, render_points_as_spheres=True)
 
         if title is not None:
-            plotter.add_text(title, position="upper_edge", font_size=15 if focus else 11)
+            plotter.add_text(title, position="upper_edge", font_size=11)
         if corner is not None:
-            plotter.add_text(corner, position="upper_left", font_size=18 if focus else 13)
+            plotter.add_text(corner, position="upper_left", font_size=13)
         if footer is not None:
-            plotter.add_text(footer, position="lower_edge", font_size=18 if focus else 12)
+            plotter.add_text(footer, position="lower_edge", font_size=12)
 
-        self._camera(plotter, points, focus=focus)
+        self._camera(plotter, points)
         return pane
+
+    def _mp4_frames(self, first_frame: np.ndarray, update_fn, seq_len: int, out_path: Path, desc: str, close_fn) -> None:
+        """
+        Encode RGB frames as MP4 through ffmpeg.
+
+        Args:
+            first_frame (np.ndarray): First RGB frame. (H, W, 3).
+            update_fn: Per-frame callback returning one RGB frame.
+            seq_len (int): Number of frames.
+            out_path (Path): Output path.
+            desc (str): Progress-bar label.
+            close_fn: Cleanup callback after encoding.
+        """
+        H, W = first_frame.shape[:2]
+        W_enc = W + (W % 2)
+        H_enc = H + (H % 2)
+
+        ffmpeg_cmd = [
+            self.FFMPEG_EXE,
+            "-y",
+            "-framerate",
+            str(self.fps),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{W}x{H}",
+            "-i",
+            "pipe:0",
+            "-vf",
+            f"pad={W_enc}:{H_enc}:0:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "22",
+            str(out_path),
+        ]
+        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        try:
+            proc.stdin.write(first_frame[:, :, :3].astype(np.uint8).tobytes())
+            for step_idx in tqdm(range(1, seq_len), desc=desc, leave=False):
+                frame = update_fn(step_idx)
+                proc.stdin.write(frame[:, :, :3].astype(np.uint8).tobytes())
+        finally:
+            proc.stdin.close()
+            proc.wait()
+            close_fn()
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg exited with code {proc.returncode}. "
+                f"Ensure ffmpeg is on PATH or set FFMPEG_EXE."
+            )
+
+    def _focus_layout(self) -> dict:
+        """
+        Return the fixed focus-video layout.
+
+        Returns:
+            dict: Canvas, pane, and colorbar geometry.
+        """
+        return {
+            "canvas_size": (1260, 1440),
+            "box_size": (954, 365),
+            "box_x": 153,
+            "box_y": (28, 508, 988),
+            "image_pos": ((189, 46), (189, 526), (189, 1006)),
+            "image_size": (882, 330),
+            "bar_pos": ((429, 396), (429, 877), (429, 1357)),
+            "bar_size": (402, 52),
+            "title_y": (0, 480, 960),
+        }
+
+    def _focus_font(self, size: int) -> ImageFont.FreeTypeFont:
+        """
+        Build a font handle for focus-video overlays.
+
+        Args:
+            size (int): Font size in pixels.
+
+        Returns:
+            ImageFont.FreeTypeFont: Loaded font.
+        """
+        return ImageFont.truetype(self.font_path, size=size)
+
+    def _focus_tick(self, value: float) -> str:
+        """
+        Format one focus colorbar tick label.
+
+        Args:
+            value (float): Tick value.
+
+        Returns:
+            str: Tick label.
+        """
+        abs_value = abs(value)
+        if abs_value >= 100.0 or (0.0 < abs_value < 1e-2):
+            return f"{value:.2e}"
+        if abs(value - round(value)) < 1e-6:
+            return f"{value:.0f}"
+        if abs_value >= 10.0:
+            return f"{value:.1f}"
+        return f"{value:.2f}"
+
+    def _focus_ticks(self, clim: Tuple[float, float], label: str) -> np.ndarray:
+        """
+        Build display ticks for one focus colorbar.
+
+        Args:
+            clim (Tuple[float, float]): Scalar range.
+            label (str): Bar label.
+
+        Returns:
+            np.ndarray: Tick values.
+        """
+        num_ticks = 5 if label == "Relative Error (%)" else 7
+        tick_lo = float(np.ceil(clim[0]))
+        tick_hi = float(np.floor(clim[1]))
+        if tick_hi <= tick_lo:
+            return np.linspace(clim[0], clim[1], num_ticks, dtype=np.float32)
+        return np.linspace(tick_lo, tick_hi, num_ticks, dtype=np.float32)
+
+    def _focus_colorbar(self, clim: Tuple[float, float], cmap: Colormap, label: str) -> Image.Image:
+        """
+        Build one fixed-position focus colorbar.
+
+        Args:
+            clim (Tuple[float, float]): Scalar range.
+            cmap (Colormap): Color map.
+            label (str): Bar label.
+
+        Returns:
+            Image.Image: RGBA colorbar image.
+        """
+        width, height = self._focus_layout()["bar_size"]
+        tick_font = self._focus_font(11)
+        label_font = self._focus_font(13)
+        canvas = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(canvas)
+
+        bar_h = 18
+        bar_y = 12
+        grad = np.linspace(0.0, 1.0, width, dtype=np.float32)
+        grad_rgb = (cmap(grad)[None, :, :3] * 255.0).astype(np.uint8)
+        grad_rgb = np.repeat(grad_rgb, bar_h, axis=0)
+        canvas.paste(Image.fromarray(grad_rgb), (0, bar_y))
+        draw.rectangle((0, bar_y, width - 1, bar_y + bar_h - 1), outline=(0, 0, 0), width=1)
+
+        ticks = self._focus_ticks(clim, label)
+        tick_x = np.linspace(0, width - 1, len(ticks))
+        for x, tick in zip(tick_x, ticks):
+            text = self._focus_tick(float(tick))
+            bbox = draw.textbbox((0, 0), text, font=tick_font)
+            text_w = bbox[2] - bbox[0]
+            text_x = int(round(x - 0.5 * text_w))
+            text_x = min(max(text_x, 0), width - text_w)
+            draw.text((text_x, 0), text, fill=(20, 20, 20), font=tick_font)
+
+        label_bbox = draw.textbbox((0, 0), label, font=label_font)
+        label_w = label_bbox[2] - label_bbox[0]
+        draw.text((0.5 * (width - label_w), 32), label, fill=(20, 20, 20), font=label_font)
+        return canvas
+
+    def _focus_plotter(
+        self,
+        mesh: pv.PolyData,
+        scalars: np.ndarray,
+        clim: Tuple[float, float],
+        points: np.ndarray,
+        cmap: Colormap,
+    ) -> Tuple[pv.Plotter, pv.PolyData]:
+        """
+        Build one off-screen plotter for focus rendering.
+
+        Args:
+            mesh (pv.PolyData): Focus-region mesh.
+            scalars (np.ndarray): Initial scalar values. (N,).
+            clim (Tuple[float, float]): Scalar range.
+            points (np.ndarray): Focus-region points. (N, 3).
+            cmap (Colormap): Color map.
+
+        Returns:
+            Tuple[pv.Plotter, pv.PolyData]: Plotter and mesh handle.
+        """
+        plotter = pv.Plotter(off_screen=True, window_size=self._focus_layout()["image_size"])
+        pane = mesh.copy()
+        pane.point_data["scalar"] = scalars.astype(np.float32)
+
+        add_kw = dict(scalars="scalar", cmap=cmap, clim=clim, show_scalar_bar=False)
+        if pane.n_cells > 0:
+            plotter.add_mesh(pane, **add_kw)
+        else:
+            plotter.add_mesh(pane, **add_kw, point_size=5, render_points_as_spheres=True)
+
+        self._camera(plotter, points)
+        return plotter, pane
+
+    def _focus_frame(
+        self,
+        pane_images: Sequence[np.ndarray],
+        titles: Sequence[str],
+        channel_name: str,
+        colorbars: Sequence[Image.Image],
+    ) -> np.ndarray:
+        """
+        Compose the final focus frame from three pane screenshots.
+
+        Args:
+            pane_images (Sequence[np.ndarray]): Pane RGB images.
+            titles (Sequence[str]): Row titles.
+            channel_name (str): Focus-channel label.
+            colorbars (Sequence[Image.Image]): Pre-rendered colorbars.
+
+        Returns:
+            np.ndarray: RGB frame. (H, W, 3).
+        """
+        layout = self._focus_layout()
+        canvas = Image.new("RGB", layout["canvas_size"], "white")
+        draw = ImageDraw.Draw(canvas)
+        title_font = self._focus_font(27)
+        corner_font = self._focus_font(26)
+        box_w, box_h = layout["box_size"]
+
+        for row_idx in range(3):
+            box_x = layout["box_x"]
+            box_y = layout["box_y"][row_idx]
+            draw.rectangle((box_x, box_y, box_x + box_w, box_y + box_h), outline=(48, 48, 48), width=3)
+
+            title = titles[row_idx]
+            title_bbox = draw.textbbox((0, 0), title, font=title_font)
+            title_w = title_bbox[2] - title_bbox[0]
+            draw.text((0.5 * (layout["canvas_size"][0] - title_w), layout["title_y"][row_idx]), title, fill=(16, 16, 16), font=title_font)
+
+            pane_image = Image.fromarray(pane_images[row_idx][:, :, :3].astype(np.uint8))
+            canvas.paste(pane_image, layout["image_pos"][row_idx])
+            canvas.paste(colorbars[row_idx], layout["bar_pos"][row_idx], colorbars[row_idx])
+
+        draw.text((171, 34), channel_name, fill=(16, 16, 16), font=corner_font)
+        return np.asarray(canvas, dtype=np.uint8)
 
     # ============================================================
     # Public interface
@@ -691,22 +921,11 @@ class FlowVis:
         rel_clim = self._clim(rel_np[:, :, 0])
         channel_name = self.ch_names[focus_channel_idx]
 
-        win_w, win_h = self._window_size(focus_points, num_cols=1, num_rows=3, focus=True)
-        plotter = pv.Plotter(
-            shape=(3, 1),
-            off_screen=True,
-            border=True,
-            border_color="#222222",
-            border_width=2.0,
-            window_size=(win_w, win_h),
-        )
-
         col_titles = [
             f"CFD Simulation (nodes: {num_nodes:,})",
             f"HyperFlowNet (params: {num_params:,})",
             f"Relative Error (accuracy: {acc:.2f}%)",
         ]
-        sbar_titles = [channel_name, channel_name, "Relative Error (%)"]
         cmaps = [
             self._value_cmap(focus_channel_idx, value_clim),
             self._value_cmap(focus_channel_idx, value_clim),
@@ -714,31 +933,41 @@ class FlowVis:
         ]
         arrays = [gt_np[:, :, 0], pred_np[:, :, 0], rel_np[:, :, 0]]
         clims = [value_clim, value_clim, rel_clim]
-
+        colorbars = [
+            self._focus_colorbar(value_clim, cmaps[0], channel_name),
+            self._focus_colorbar(value_clim, cmaps[1], channel_name),
+            self._focus_colorbar(rel_clim, cmaps[2], "Relative Error (%)"),
+        ]
+        plotters: List[pv.Plotter] = []
         panes: List[pv.PolyData] = []
-        for row_idx in range(3):
-            plotter.subplot(row_idx, 0)
-            panes.append(
-                self._draw(
-                    plotter=plotter,
-                    mesh=focus_mesh,
-                    scalars=arrays[row_idx][0],
-                    ch_idx=focus_channel_idx,
-                    clim=clims[row_idx],
-                    sbar_title=sbar_titles[row_idx],
-                    title=col_titles[row_idx],
-                    corner=channel_name if row_idx == 0 else None,
-                    footer=None,
-                    points=focus_points,
-                    focus=True,
-                    cmap=cmaps[row_idx],
-                )
-            )
 
-        def _update(step_idx: int) -> None:
+        for row_idx in range(3):
+            plotter, pane = self._focus_plotter(
+                mesh=focus_mesh,
+                scalars=arrays[row_idx][0],
+                clim=clims[row_idx],
+                points=focus_points,
+                cmap=cmaps[row_idx],
+            )
+            plotters.append(plotter)
+            panes.append(pane)
+
+        def _snapshot() -> np.ndarray:
+            pane_images = []
+            for plotter in plotters:
+                plotter.render()
+                pane_images.append(plotter.screenshot(return_img=True))
+            return self._focus_frame(pane_images, col_titles, channel_name, colorbars)
+
+        def _update(step_idx: int) -> np.ndarray:
             for row_idx, pane in enumerate(panes):
                 pane.point_data["scalar"] = arrays[row_idx][step_idx].astype(np.float32)
+            return _snapshot()
+
+        def _close() -> None:
+            for plotter in plotters:
+                plotter.close()
 
         out_path = self.output_dir / f"{label}_focus_{channel_name.lower()}.mp4"
-        self._mp4(plotter, _update, seq_len, out_path, desc=f"Rendering {label} focus")
+        self._mp4_frames(_snapshot(), _update, seq_len, out_path, desc=f"Rendering {label} focus", close_fn=_close)
         logger.info(f"focus video saved to {hue.g}{out_path}{hue.q}")
