@@ -297,9 +297,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = output_dir / "best.pt"
-    if not checkpoint_path.exists():
-        checkpoint_path = output_dir / "ckpt.pt"
+    checkpoint_path = output_dir / "ckpt.pt"
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     params = checkpoint["params"]

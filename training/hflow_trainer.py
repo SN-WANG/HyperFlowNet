@@ -12,19 +12,21 @@ from training.base_trainer import BaseTrainer
 from utils.hue_logger import hue, logger
 
 
-class ChannelWiseMSELoss(nn.Module):
+class NMSECriterion(nn.Module):
     """
-    Channel-wise weighted mean squared error loss.
+    Per-channel normalized mean squared error loss.
     """
 
-    def __init__(self, channel_weights: Optional[list[float]] = None) -> None:
+    def __init__(self, eps: float = 1e-8, channel_weights: Optional[list[float]] = None) -> None:
         """
-        Initialize the channel-wise MSE loss.
+        Initialize the NMSE loss.
 
         Args:
+            eps (float): Small value added to the denominator.
             channel_weights (Optional[list[float]]): Optional per-channel weights.
         """
         super().__init__()
+        self.eps = eps
         if channel_weights is None:
             self.channel_weights = None
         else:
@@ -32,21 +34,29 @@ class ChannelWiseMSELoss(nn.Module):
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
         """
-        Compute channel-wise weighted MSE.
+        Compute channel-wise weighted NMSE.
 
         Args:
             pred (Tensor): Predicted state. (B, N, C).
             target (Tensor): Target state. (B, N, C).
 
         Returns:
-            Tensor: Scalar MSE loss. ().
+            Tensor: Scalar NMSE loss. ().
         """
-        per_channel_mse = (pred - target).square().reshape(-1, pred.shape[-1]).mean(dim=0)
-        if self.channel_weights is None:
-            return per_channel_mse.mean()
+        if pred.shape != target.shape:
+            raise ValueError(f"Shape mismatch: pred {pred.shape} vs target {target.shape}")
 
-        channel_weights = self.channel_weights.to(device=pred.device, dtype=pred.dtype)
-        return (channel_weights * per_channel_mse).sum() / channel_weights.sum()
+        C = pred.shape[-1]
+        sq_err = (target - pred) ** 2
+        mse_c = sq_err.reshape(-1, C).sum(0)
+        norm_c = (target ** 2).reshape(-1, C).sum(0) + self.eps
+        nmse_c = mse_c / norm_c
+        if self.channel_weights is None:
+            return nmse_c.mean()
+
+        channel_weights = self.channel_weights.to(device=nmse_c.device, dtype=nmse_c.dtype)
+        nmse_c = nmse_c * channel_weights
+        return nmse_c.sum() / channel_weights.sum()
 
 
 class HyperFlowTrainer(BaseTrainer):
@@ -81,7 +91,7 @@ class HyperFlowTrainer(BaseTrainer):
             rollout_patience (int): Epochs between curriculum advances.
             noise_std_init (float): Initial Gaussian noise level.
             noise_decay (float): Multiplicative decay of rollout noise.
-            channel_weights (Optional[list[float]]): Optional per-channel MSE weights.
+            channel_weights (Optional[list[float]]): Optional per-channel NMSE weights.
             **kwargs: Arguments forwarded to BaseTrainer.
         """
         optimizer = kwargs.pop("optimizer", None)
@@ -93,7 +103,7 @@ class HyperFlowTrainer(BaseTrainer):
         if scheduler is None:
             scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=eta_min)
         if criterion is None:
-            criterion = ChannelWiseMSELoss(channel_weights=channel_weights)
+            criterion = NMSECriterion(channel_weights=channel_weights)
 
         super().__init__(
             model=model,
@@ -143,7 +153,7 @@ class HyperFlowTrainer(BaseTrainer):
 
     def _compute_loss(self, batch: Any) -> Tensor:
         """
-        Compute weighted rollout MSE with curriculum and noise injection.
+        Compute weighted rollout NMSE with curriculum and noise injection.
 
         Args:
             batch (Any): Batch tuple ``(seq, coords, t0_norm, dt_norm)``.
