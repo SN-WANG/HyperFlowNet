@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 import config
@@ -188,6 +188,129 @@ def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    def measure_train_batch_time(trainer: Any, batch: tuple[Tensor, Tensor, Tensor, Tensor], rollout_steps: int,
+                                 repeats: int = 2) -> float:
+        """
+        Measure average train-batch time for one rollout depth on the active device.
+
+        Args:
+            trainer (Any): Configured trainer.
+            batch (tuple[Tensor, Tensor, Tensor, Tensor]): Cached training batch on device.
+            rollout_steps (int): Rollout steps used in the loss.
+            repeats (int): Number of timed repeats after one warm-up pass.
+
+        Returns:
+            float: Average train-batch time in seconds.
+        """
+        trainer.current_rollout_steps = rollout_steps
+        trainer.current_noise_std = trainer.noise_std_init
+        trainer.model.train()
+
+        durations = []
+        for repeat_idx in range(repeats + 1):
+            trainer.optimizer.zero_grad(set_to_none=True)
+            torch.cuda.synchronize(trainer.device)
+            start = time.perf_counter()
+            loss = trainer._compute_loss(batch)
+            loss.backward()
+            trainer.optimizer.step()
+            torch.cuda.synchronize(trainer.device)
+            if repeat_idx > 0:
+                durations.append(time.perf_counter() - start)
+
+        return float(sum(durations) / len(durations))
+
+    def measure_val_batch_time(trainer: Any, batch: tuple[Tensor, Tensor, Tensor, Tensor], rollout_steps: int,
+                               repeats: int = 2) -> float:
+        """
+        Measure average validation-batch time for one rollout depth on the active device.
+
+        Args:
+            trainer (Any): Configured trainer.
+            batch (tuple[Tensor, Tensor, Tensor, Tensor]): Cached validation batch on device.
+            rollout_steps (int): Rollout steps used in the loss.
+            repeats (int): Number of timed repeats after one warm-up pass.
+
+        Returns:
+            float: Average validation-batch time in seconds.
+        """
+        trainer.current_rollout_steps = rollout_steps
+        trainer.current_noise_std = 0.0
+        trainer.model.eval()
+
+        durations = []
+        with torch.no_grad():
+            for repeat_idx in range(repeats + 1):
+                torch.cuda.synchronize(trainer.device)
+                start = time.perf_counter()
+                trainer._compute_loss(batch)
+                torch.cuda.synchronize(trainer.device)
+                if repeat_idx > 0:
+                    durations.append(time.perf_counter() - start)
+
+        return float(sum(durations) / len(durations))
+
+    def fit_affine_time(sample_steps: list[int], sample_times: list[float]) -> tuple[float, float]:
+        """
+        Fit an affine batch-time model t(k) = bias + slope * k from probe samples.
+
+        Args:
+            sample_steps (list[int]): Sampled rollout depths.
+            sample_times (list[float]): Measured batch times for each depth.
+
+        Returns:
+            tuple[float, float]: Non-negative affine coefficients (bias, slope).
+        """
+        if len(sample_steps) == 1:
+            return 0.0, sample_times[0]
+
+        x = torch.tensor(sample_steps, dtype=torch.float64)
+        y = torch.tensor(sample_times, dtype=torch.float64)
+        x_centered = x - x.mean()
+        denom = torch.dot(x_centered, x_centered).item()
+        if denom <= 1e-12:
+            return 0.0, float(y.mean().item())
+
+        slope = float(torch.dot(x_centered, y - y.mean()).item() / denom)
+        bias = float((y.mean() - slope * x.mean()).item())
+        return max(bias, 0.0), max(slope, 0.0)
+
+    def reachable_rollout_steps(seq_len: int) -> int:
+        """
+        Compute the maximum rollout depth that this run can actually reach.
+
+        Args:
+            seq_len (int): Temporal window length.
+
+        Returns:
+            int: Reachable rollout depth under the current curriculum schedule.
+        """
+        max_rollout = min(args.max_rollout_steps, seq_len - 1)
+        if args.rollout_patience <= 0:
+            return max_rollout
+
+        scheduled_rollout = 1 + max(args.max_epochs - 1, 0) // args.rollout_patience
+        return min(max_rollout, scheduled_rollout)
+
+    def curriculum_schedule(max_rollout_steps: int) -> list[int]:
+        """
+        Build the rollout depth used at each epoch under the current curriculum.
+
+        Args:
+            max_rollout_steps (int): Maximum reachable rollout depth.
+
+        Returns:
+            list[int]: Rollout depth for each epoch.
+        """
+        if args.rollout_patience <= 0:
+            return [max_rollout_steps] * args.max_epochs
+
+        schedule = []
+        for epoch_idx in range(args.max_epochs):
+            step = 1 + epoch_idx // args.rollout_patience
+            schedule.append(min(step, max_rollout_steps))
+        return schedule
+
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
 
@@ -207,40 +330,51 @@ def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
     val_t0_norm = val_t0_norm.to(device)
     val_dt_norm = val_dt_norm.to(device)
 
-    trainer.model.train()
-    trainer.optimizer.zero_grad(set_to_none=True)
-    trainer.current_rollout_steps = min(args.max_rollout_steps, seq_std.shape[1] - 1)
-    trainer.current_noise_std = 0.0
+    reachable_rollout = reachable_rollout_steps(seq_std.shape[1])
+    sample_steps = sorted(set([1, max(1, reachable_rollout // 2), reachable_rollout]))
+    schedule = curriculum_schedule(reachable_rollout)
 
     B, T, N, C = seq_std.shape
     total_params = sum(p.numel() for p in trainer.model.parameters())
     train_steps = len(train_loader)
-    torch.cuda.synchronize(device)
-    probe_start = time.perf_counter()
-    loss = trainer._compute_loss((seq_std, coords_norm, t0_norm, dt_norm))
+    val_steps = len(val_loader)
+    train_batch = (seq_std, coords_norm, t0_norm, dt_norm)
+    val_batch = (val_seq_std, val_coords_norm, val_t0_norm, val_dt_norm)
+
+    train_times = [
+        measure_train_batch_time(trainer, train_batch, rollout_steps=step)
+        for step in sample_steps
+    ]
+    val_times = [
+        measure_val_batch_time(trainer, val_batch, rollout_steps=step)
+        for step in sample_steps
+    ]
+
+    train_bias, train_slope = fit_affine_time(sample_steps, train_times)
+    val_bias, val_slope = fit_affine_time(sample_steps, val_times)
+
+    epoch_seconds = [
+        train_steps * (train_bias + train_slope * step) + val_steps * (val_bias + val_slope * step)
+        for step in schedule
+    ]
+    total_seconds = float(sum(epoch_seconds))
+    finish_at = datetime.now().astimezone() + timedelta(seconds=total_seconds)
+
+    trainer.current_rollout_steps = reachable_rollout
+    trainer.current_noise_std = 0.0
+    trainer.model.train()
+    trainer.optimizer.zero_grad(set_to_none=True)
+    torch.cuda.reset_peak_memory_stats(device)
+    loss = trainer._compute_loss(train_batch)
     loss.backward()
     trainer.optimizer.step()
     torch.cuda.synchronize(device)
-    train_batch_time = time.perf_counter() - probe_start
-
-    val_steps = len(val_loader)
-    trainer.model.eval()
-    torch.cuda.synchronize(device)
-    probe_start = time.perf_counter()
-    with torch.no_grad():
-        trainer._compute_loss((val_seq_std, val_coords_norm, val_t0_norm, val_dt_norm))
-    torch.cuda.synchronize(device)
-    val_batch_time = time.perf_counter() - probe_start
-
-    rollout_sum = sum(min(1 + epoch // args.rollout_patience, trainer.current_rollout_steps) for epoch in range(args.max_epochs))
-    total_seconds = (train_batch_time * train_steps + val_batch_time * val_steps) * rollout_sum / trainer.current_rollout_steps
-    finish_at = datetime.now().astimezone() + timedelta(seconds=total_seconds)
 
     logger.info(
         f"{hue.y}probe config:{hue.q} "
         f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, "
         f"nodes={hue.m}{N}{hue.q}, channels={hue.m}{C}{hue.q}, "
-        f"max_rollout={hue.m}{trainer.current_rollout_steps}{hue.q}, "
+        f"schedule_rollout={hue.m}{reachable_rollout}{hue.q}/{hue.m}{min(args.max_rollout_steps, T - 1)}{hue.q}, "
         f"params={hue.m}{total_params}{hue.q}"
     )
 
