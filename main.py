@@ -399,7 +399,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint = torch.load(output_dir / args.checkpoint_name, map_location=device, weights_only=True)
+    checkpoint = torch.load(output_dir / "ckpt.pt", map_location=device, weights_only=True)
     params = checkpoint["params"]
     scaler_state = checkpoint["scaler_state_dict"]
 

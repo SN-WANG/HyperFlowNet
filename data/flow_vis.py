@@ -430,6 +430,7 @@ class FlowVis:
         ch_idx: int,
         clim: Tuple[float, float],
         sbar_title: str,
+        sbar_key: str | None,
         title: str | None,
         corner: str | None,
         footer: str | None,
@@ -446,6 +447,7 @@ class FlowVis:
             ch_idx (int): Channel index.
             clim (Tuple[float, float]): Scalar limits.
             sbar_title (str): Scalar-bar title.
+            sbar_key (str | None): Internal scalar-bar key for PyVista.
             title (str | None): Top centered title.
             corner (str | None): Upper-left label.
             footer (str | None): Bottom centered label.
@@ -462,12 +464,14 @@ class FlowVis:
             scalars="scalar",
             cmap=self._value_cmap(ch_idx, clim) if cmap is None else cmap,
             clim=clim,
-            scalar_bar_args={**self._sbar_args(), "title": sbar_title},
+            scalar_bar_args={**self._sbar_args(), "title": sbar_title if sbar_key is None else sbar_key},
         )
         if pane.n_cells > 0:
             plotter.add_mesh(pane, **add_kw)
         else:
             plotter.add_mesh(pane, **add_kw, point_size=5, render_points_as_spheres=True)
+        if sbar_key is not None:
+            plotter.scalar_bars._scalar_bar_actors[sbar_key].SetTitle(sbar_title)
 
         if title is not None:
             plotter.add_text(title, position="upper_edge", font_size=11)
@@ -762,6 +766,7 @@ class FlowVis:
                     ch_idx=ch_idx,
                     clim=clims[ch_idx],
                     sbar_title=self.ch_names[ch_idx],
+                    sbar_key=None,
                     title=f"Field: {self.ch_names[ch_idx]}",
                     corner=None,
                     footer=None,
@@ -829,6 +834,11 @@ class FlowVis:
                 self.ch_names[ch_idx] if ch_idx != self.p_idx else "P (Pa)",
                 "Relative Error (%)",
             ]
+            sbar_keys = [
+                self.ch_names[ch_idx] if ch_idx != self.p_idx else "P (Pa)",
+                self.ch_names[ch_idx] if ch_idx != self.p_idx else "P (Pa)",
+                f"Relative Error (%) [{self.ch_names[ch_idx]}]",
+            ]
             cmaps = [
                 self._value_cmap(ch_idx, value_clims[ch_idx]),
                 self._value_cmap(ch_idx, value_clims[ch_idx]),
@@ -847,6 +857,7 @@ class FlowVis:
                         ch_idx=ch_idx,
                         clim=clims[col_idx],
                         sbar_title=sbar_titles[col_idx],
+                        sbar_key=sbar_keys[col_idx],
                         title=col_titles[col_idx],
                         corner=self.ch_names[ch_idx] if col_idx == 0 else None,
                         footer=None,

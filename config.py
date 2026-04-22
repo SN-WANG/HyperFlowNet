@@ -81,6 +81,12 @@ def get_args() -> argparse.Namespace:
         "--frontier_beta", type=float, default=1.0, help="Frontier contrast strength in slice assignment."
     )
     hflownet.add_argument(
+        "--graph_k", type=int, default=8, help="Number of nearest neighbors in the local graph."
+    )
+    hflownet.add_argument(
+        "--graph_sigma_scale", type=float, default=1.5, help="Distance scale multiplier of graph weights."
+    )
+    hflownet.add_argument(
         "--coord_features", type=int, default=8, help="Half-dimension of Fourier spatial encoding."
     )
     hflownet.add_argument(
