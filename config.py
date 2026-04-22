@@ -1,4 +1,4 @@
-# Argument configuration for HyperFlowNet
+# Argument configuration for HyperFlowNet shock-wave flow simulation
 # Author: Shengning Wang
 
 import argparse
@@ -8,13 +8,13 @@ import torch
 
 def get_args() -> argparse.Namespace:
     """
-    Parse command-line arguments for the HyperFlowNet workflow.
+    Parse command-line arguments for HyperFlowNet shock-wave flow simulation.
 
     Returns:
         argparse.Namespace: Parsed experiment arguments.
     """
     parser = argparse.ArgumentParser(
-        description="HyperFlowNet: A Spatio-Temporal Neural Operator for Flow Simulation",
+        description="HyperFlowNet: A Spatio-Temporal Neural Operator for Shock-Wave Flow Simulation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -75,15 +75,10 @@ def get_args() -> argparse.Namespace:
         "--num_slices", type=int, default=32, help="Number of slice tokens."
     )
     hflownet.add_argument(
-    "--num_heads", type=int, default=8, help="Number of slice-space attention heads."
+        "--num_heads", type=int, default=8, help="Number of slice-space attention heads."
     )
     hflownet.add_argument(
-        "--use_spatial_encoding", action=argparse.BooleanOptionalAction, default=True,
-        help="Enable learnable Fourier spatial encoding.",
-    )
-    hflownet.add_argument(
-        "--use_temporal_encoding", action=argparse.BooleanOptionalAction, default=True,
-        help="Enable sinusoidal temporal encoding.",
+        "--frontier_beta", type=float, default=1.0, help="Frontier contrast strength in slice assignment."
     )
     hflownet.add_argument(
         "--coord_features", type=int, default=8, help="Half-dimension of Fourier spatial encoding."
@@ -114,6 +109,24 @@ def get_args() -> argparse.Namespace:
     )
     trainer.add_argument(
         "--channel_weights", type=float, nargs="+", default=[1.0, 3.0, 1.0, 1.0], help="Per-channel loss weights."
+    )
+    trainer.add_argument(
+        "--frontier_blocks", type=int, default=3, help="Number of regularized early blocks."
+    )
+    trainer.add_argument(
+        "--frontier_q_low", type=float, default=0.25, help="Low contrast quantile."
+    )
+    trainer.add_argument(
+        "--frontier_q_high", type=float, default=0.75, help="High contrast quantile."
+    )
+    trainer.add_argument(
+        "--frontier_margin", type=float, default=0.10, help="Allowed frontier overlap."
+    )
+    trainer.add_argument(
+        "--lambda_smooth", type=float, default=0.05, help="Weight of L_smooth."
+    )
+    trainer.add_argument(
+        "--lambda_frontier", type=float, default=0.05, help="Weight of L_frontier."
     )
 
     # ============================================================

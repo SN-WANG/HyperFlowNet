@@ -1,4 +1,4 @@
-# Main script for HyperFlowNet probing, training and inference
+# Main script for HyperFlowNet shock-wave flow simulation workflows
 # Author: Shengning Wang
 
 import json
@@ -12,33 +12,36 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 import config
-
 from data.flow_data import FlowData
 from data.flow_metrics import Metrics
 from data.flow_vis import FlowVis
 from data.initial_state import initial_state_from_label
-
-from models.hflownet import HyperFlowNet
+from models.hflownet import HyperFlowNet, build_local_graph
 from training.hflow_trainer import HyperFlowTrainer
-
 from utils.hue_logger import hue, logger
-from utils.seeder import seed_everything
 from utils.scaler import MinMaxScalerTensor, StandardScalerTensor
+from utils.seeder import seed_everything
 
 
 def build_model(
     args: Any | None = None,
     model_args: Dict[str, Any] | None = None,
+    adj_indices: Tensor | None = None,
+    adj_values: Tensor | None = None,
+    edge_index: Tensor | None = None,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
-    Build model and return its constructor arguments.
+    Build HyperFlowNet for shock-wave flow simulation and return its constructor arguments.
 
     Args:
-        args (Any | None): Parsed command-line arguments.
+        args (Any | None): Parsed arguments.
         model_args (Dict[str, Any] | None): Explicit model arguments.
+        adj_indices (Tensor | None): Sparse adjacency indices. (2, E).
+        adj_values (Tensor | None): Sparse adjacency values. (E,).
+        edge_index (Tensor | None): Undirected edge list. (2, E_EDGE).
 
     Returns:
-        Tuple[nn.Module, Dict[str, Any]]: Model instance and model arguments.
+        Tuple[nn.Module, Dict[str, Any]]: Model instance and model argument dict.
     """
     if model_args is None:
         model_args = {
@@ -49,13 +52,19 @@ def build_model(
             "depth": args.depth,
             "num_slices": args.num_slices,
             "num_heads": args.num_heads,
-            "use_spatial_encoding": args.use_spatial_encoding,
-            "use_temporal_encoding": args.use_temporal_encoding,
+            "frontier_beta": args.frontier_beta,
             "coord_features": args.coord_features,
             "time_features": args.time_features,
             "freq_base": args.freq_base,
         }
-    return HyperFlowNet(**model_args), model_args
+
+    model = HyperFlowNet(
+        adj_indices=adj_indices,
+        adj_values=adj_values,
+        edge_index=edge_index,
+        **model_args,
+    )
+    return model, model_args
 
 
 def build_trainer(
@@ -64,44 +73,50 @@ def build_trainer(
     params: Dict[str, Any],
     scalers: Dict[str, object],
     output_dir: Path,
-) -> Any:
+) -> HyperFlowTrainer:
     """
-    Build trainer.
+    Build the HyperFlowNet rollout trainer.
 
     Args:
-        args (Any): Parsed command-line arguments.
-        model (HyperFlowNet): HyperFlowNet model.
+        args (Any): Parsed arguments.
+        model (HyperFlowNet): HyperFlowNet model for shock-wave flow simulation.
         params (Dict[str, Any]): Checkpoint parameters.
-        scalers (Dict[str, object]): Saved scaler objects.
-        output_dir (Path): Output directory.
+        scalers (Dict[str, object]): Fitted scalers.
+        output_dir (Path): Artifact directory.
 
     Returns:
-        Any: Configured trainer.
+        HyperFlowTrainer: Configured trainer.
     """
     return HyperFlowTrainer(
         model=model,
+        params=params,
+        scalers=scalers,
+        output_dir=output_dir,
+        device=args.device,
         lr=args.lr,
-        max_epochs=args.max_epochs,
         weight_decay=args.weight_decay,
+        max_epochs=args.max_epochs,
         eta_min=args.eta_min,
         max_rollout_steps=args.max_rollout_steps,
         rollout_patience=args.rollout_patience,
         noise_std_init=args.noise_std_init,
         noise_decay=args.noise_decay,
         channel_weights=args.channel_weights,
-        params=params,
-        scalers=scalers,
-        output_dir=output_dir,
-        device=args.device,
+        frontier_blocks=args.frontier_blocks,
+        frontier_q_low=args.frontier_q_low,
+        frontier_q_high=args.frontier_q_high,
+        frontier_margin=args.frontier_margin,
+        lambda_smooth=args.lambda_smooth,
+        lambda_frontier=args.lambda_frontier,
     )
 
 
 def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
     """
-    Build the data runtime for probe, train, and infer.
+    Build datasets, scalers, and loaders for the current run.
 
     Args:
-        args (Any): Parsed command-line arguments.
+        args (Any): Parsed arguments.
 
     Returns:
         Tuple[DataLoader, DataLoader, FlowData]: Train loader, validation loader, and raw test data.
@@ -115,9 +130,9 @@ def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
         win_stride=args.win_stride,
     )
 
-    train_seqs = torch.cat(train_data.seqs, dim=0)
+    train_states = torch.cat(train_data.seqs, dim=0)
     train_coords = torch.cat(train_data.coords, dim=0)
-    args.state_scaler = StandardScalerTensor().fit(train_seqs, channel_dim=-1)
+    args.state_scaler = StandardScalerTensor().fit(train_states, channel_dim=-1)
     args.coord_scaler = MinMaxScalerTensor(norm_range="bipolar").fit(train_coords, channel_dim=-1)
 
     train_dataset = [
@@ -127,13 +142,7 @@ def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
             torch.tensor(t0_norm, dtype=seq.dtype),
             torch.tensor(dt_norm, dtype=seq.dtype),
         )
-        for seq, coords, _, t0_norm, dt_norm in zip(
-            train_data.seqs,
-            train_data.coords,
-            train_data.labels,
-            train_data.t0_norm,
-            train_data.dt_norm,
-        )
+        for seq, coords, t0_norm, dt_norm in zip(train_data.seqs, train_data.coords, train_data.t0_norm, train_data.dt_norm)
     ]
     val_dataset = [
         (
@@ -142,13 +151,7 @@ def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
             torch.tensor(t0_norm, dtype=seq.dtype),
             torch.tensor(dt_norm, dtype=seq.dtype),
         )
-        for seq, coords, _, t0_norm, dt_norm in zip(
-            val_data.seqs,
-            val_data.coords,
-            val_data.labels,
-            val_data.t0_norm,
-            val_data.dt_norm,
-        )
+        for seq, coords, t0_norm, dt_norm in zip(val_data.seqs, val_data.coords, val_data.t0_norm, val_data.dt_norm)
     ]
 
     train_loader = DataLoader(
@@ -170,10 +173,10 @@ def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
 
 def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) -> None:
     """
-    Execute one rollout step for peak GPU memory and training eta probing.
+    Probe peak GPU memory and projected training time.
 
     Args:
-        args (Any): Parsed command-line arguments.
+        args (Any): Parsed arguments.
         train_loader (DataLoader): Training loader.
         val_loader (DataLoader): Validation loader.
     """
@@ -181,182 +184,115 @@ def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
 
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
-        logger.warning("No CUDA device - probe skipped.")
+        logger.warning("CUDA is unavailable, probe skipped.")
         logger.info(f"{hue.g}============================== [PROBE PIPELINE] END ==============================={hue.q}")
         return
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    def measure_train_batch_time(trainer: Any, batch: tuple[Tensor, Tensor, Tensor, Tensor], rollout_steps: int,
-                                 repeats: int = 2) -> float:
-        """
-        Measure average train-batch time for one rollout depth on the active device.
+    ref_coords = train_loader.dataset[0][1]
+    adj_indices, adj_values, edge_index = build_local_graph(
+        coords=ref_coords,
+        k=args.graph_k,
+        sigma_scale=args.graph_sigma_scale,
+    )
+    model, model_args = build_model(
+        args=args,
+        adj_indices=adj_indices,
+        adj_values=adj_values,
+        edge_index=edge_index,
+    )
+    params = {
+        "channel_names": args.channel_names,
+        "model_args": model_args,
+        "graph_k": args.graph_k,
+        "graph_sigma_scale": args.graph_sigma_scale,
+    }
+    scalers = {
+        "state_scaler": args.state_scaler,
+        "coord_scaler": args.coord_scaler,
+    }
+    trainer = build_trainer(args, model, params, scalers, output_dir)
 
-        Args:
-            trainer (Any): Configured trainer.
-            batch (tuple[Tensor, Tensor, Tensor, Tensor]): Cached training batch on device.
-            rollout_steps (int): Rollout steps used in the loss.
-            repeats (int): Number of timed repeats after one warm-up pass.
+    train_batch = tuple(t.to(device) for t in next(iter(train_loader)))
+    val_batch = tuple(t.to(device) for t in next(iter(val_loader)))
 
-        Returns:
-            float: Average train-batch time in seconds.
-        """
+    reachable_rollout = min(args.max_rollout_steps, train_batch[0].shape[1] - 1)
+    if args.rollout_patience > 0:
+        scheduled_rollout = 1 + max(args.max_epochs - 1, 0) // args.rollout_patience
+        reachable_rollout = min(reachable_rollout, scheduled_rollout)
+    sample_steps = sorted({1, max(1, reachable_rollout // 2), reachable_rollout})
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+
+    train_times = []
+    for rollout_steps in sample_steps:
         trainer.current_rollout_steps = rollout_steps
         trainer.current_noise_std = trainer.noise_std_init
         trainer.model.train()
 
         durations = []
-        for repeat_idx in range(repeats + 1):
+        for repeat_idx in range(3):
             trainer.optimizer.zero_grad(set_to_none=True)
-            torch.cuda.synchronize(trainer.device)
+            torch.cuda.synchronize(device)
             start = time.perf_counter()
-            loss = trainer._compute_loss(batch)
+            loss = trainer.compute_loss(train_batch)
             loss.backward()
             trainer.optimizer.step()
-            torch.cuda.synchronize(trainer.device)
+            torch.cuda.synchronize(device)
             if repeat_idx > 0:
                 durations.append(time.perf_counter() - start)
+        train_times.append(sum(durations) / len(durations))
 
-        return float(sum(durations) / len(durations))
-
-    def measure_val_batch_time(trainer: Any, batch: tuple[Tensor, Tensor, Tensor, Tensor], rollout_steps: int,
-                               repeats: int = 2) -> float:
-        """
-        Measure average validation-batch time for one rollout depth on the active device.
-
-        Args:
-            trainer (Any): Configured trainer.
-            batch (tuple[Tensor, Tensor, Tensor, Tensor]): Cached validation batch on device.
-            rollout_steps (int): Rollout steps used in the loss.
-            repeats (int): Number of timed repeats after one warm-up pass.
-
-        Returns:
-            float: Average validation-batch time in seconds.
-        """
+    val_times = []
+    for rollout_steps in sample_steps:
         trainer.current_rollout_steps = rollout_steps
         trainer.current_noise_std = 0.0
         trainer.model.eval()
 
         durations = []
         with torch.no_grad():
-            for repeat_idx in range(repeats + 1):
-                torch.cuda.synchronize(trainer.device)
+            for repeat_idx in range(3):
+                torch.cuda.synchronize(device)
                 start = time.perf_counter()
-                trainer._compute_loss(batch)
-                torch.cuda.synchronize(trainer.device)
+                trainer.compute_loss(val_batch)
+                torch.cuda.synchronize(device)
                 if repeat_idx > 0:
                     durations.append(time.perf_counter() - start)
+        val_times.append(sum(durations) / len(durations))
 
-        return float(sum(durations) / len(durations))
-
-    def fit_affine_time(sample_steps: list[int], sample_times: list[float]) -> tuple[float, float]:
-        """
-        Fit an affine batch-time model t(k) = bias + slope * k from probe samples.
-
-        Args:
-            sample_steps (list[int]): Sampled rollout depths.
-            sample_times (list[float]): Measured batch times for each depth.
-
-        Returns:
-            tuple[float, float]: Non-negative affine coefficients (bias, slope).
-        """
-        if len(sample_steps) == 1:
-            return 0.0, sample_times[0]
-
+    if len(sample_steps) == 1:
+        train_bias, train_slope = 0.0, train_times[0]
+        val_bias, val_slope = 0.0, val_times[0]
+    else:
         x = torch.tensor(sample_steps, dtype=torch.float64)
-        y = torch.tensor(sample_times, dtype=torch.float64)
         x_centered = x - x.mean()
         denom = torch.dot(x_centered, x_centered).item()
-        if denom <= 1e-12:
-            return 0.0, float(y.mean().item())
 
-        slope = float(torch.dot(x_centered, y - y.mean()).item() / denom)
-        bias = float((y.mean() - slope * x.mean()).item())
-        return max(bias, 0.0), max(slope, 0.0)
+        y = torch.tensor(train_times, dtype=torch.float64)
+        train_slope = float(torch.dot(x_centered, y - y.mean()).item() / denom)
+        train_bias = float((y.mean() - train_slope * x.mean()).item())
 
-    def reachable_rollout_steps(seq_len: int) -> int:
-        """
-        Compute the maximum rollout depth that this run can actually reach.
+        y = torch.tensor(val_times, dtype=torch.float64)
+        val_slope = float(torch.dot(x_centered, y - y.mean()).item() / denom)
+        val_bias = float((y.mean() - val_slope * x.mean()).item())
 
-        Args:
-            seq_len (int): Temporal window length.
-
-        Returns:
-            int: Reachable rollout depth under the current curriculum schedule.
-        """
-        max_rollout = min(args.max_rollout_steps, seq_len - 1)
+    rollout_schedule = []
+    for epoch_idx in range(args.max_epochs):
         if args.rollout_patience <= 0:
-            return max_rollout
-
-        scheduled_rollout = 1 + max(args.max_epochs - 1, 0) // args.rollout_patience
-        return min(max_rollout, scheduled_rollout)
-
-    def curriculum_schedule(max_rollout_steps: int) -> list[int]:
-        """
-        Build the rollout depth used at each epoch under the current curriculum.
-
-        Args:
-            max_rollout_steps (int): Maximum reachable rollout depth.
-
-        Returns:
-            list[int]: Rollout depth for each epoch.
-        """
-        if args.rollout_patience <= 0:
-            return [max_rollout_steps] * args.max_epochs
-
-        schedule = []
-        for epoch_idx in range(args.max_epochs):
+            rollout_schedule.append(reachable_rollout)
+        else:
             step = 1 + epoch_idx // args.rollout_patience
-            schedule.append(min(step, max_rollout_steps))
-        return schedule
+            rollout_schedule.append(min(step, reachable_rollout))
 
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
+    epoch_seconds = []
+    for rollout_steps in rollout_schedule:
+        train_epoch = len(train_loader) * (max(train_bias, 0.0) + max(train_slope, 0.0) * rollout_steps)
+        val_epoch = len(val_loader) * (max(val_bias, 0.0) + max(val_slope, 0.0) * rollout_steps)
+        epoch_seconds.append(train_epoch + val_epoch)
 
-    model, model_args = build_model(args=args)
-    params = {"model_args": model_args, "channel_names": args.channel_names}
-    scalers = {"state_scaler": args.state_scaler, "coord_scaler": args.coord_scaler}
-    trainer = build_trainer(args, model, params, scalers, output_dir)
-
-    seq_std, coords_norm, t0_norm, dt_norm = next(iter(train_loader))
-    seq_std = seq_std.to(device)
-    coords_norm = coords_norm.to(device)
-    t0_norm = t0_norm.to(device)
-    dt_norm = dt_norm.to(device)
-    val_seq_std, val_coords_norm, val_t0_norm, val_dt_norm = next(iter(val_loader))
-    val_seq_std = val_seq_std.to(device)
-    val_coords_norm = val_coords_norm.to(device)
-    val_t0_norm = val_t0_norm.to(device)
-    val_dt_norm = val_dt_norm.to(device)
-
-    reachable_rollout = reachable_rollout_steps(seq_std.shape[1])
-    sample_steps = sorted(set([1, max(1, reachable_rollout // 2), reachable_rollout]))
-    schedule = curriculum_schedule(reachable_rollout)
-
-    B, T, N, C = seq_std.shape
-    total_params = sum(p.numel() for p in trainer.model.parameters())
-    train_steps = len(train_loader)
-    val_steps = len(val_loader)
-    train_batch = (seq_std, coords_norm, t0_norm, dt_norm)
-    val_batch = (val_seq_std, val_coords_norm, val_t0_norm, val_dt_norm)
-
-    train_times = [
-        measure_train_batch_time(trainer, train_batch, rollout_steps=step)
-        for step in sample_steps
-    ]
-    val_times = [
-        measure_val_batch_time(trainer, val_batch, rollout_steps=step)
-        for step in sample_steps
-    ]
-
-    train_bias, train_slope = fit_affine_time(sample_steps, train_times)
-    val_bias, val_slope = fit_affine_time(sample_steps, val_times)
-
-    epoch_seconds = [
-        train_steps * (train_bias + train_slope * step) + val_steps * (val_bias + val_slope * step)
-        for step in schedule
-    ]
     total_seconds = float(sum(epoch_seconds))
     finish_at = datetime.now().astimezone() + timedelta(seconds=total_seconds)
 
@@ -365,22 +301,17 @@ def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
     trainer.model.train()
     trainer.optimizer.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats(device)
-    loss = trainer._compute_loss(train_batch)
+    loss = trainer.compute_loss(train_batch)
     loss.backward()
     trainer.optimizer.step()
     torch.cuda.synchronize(device)
 
-    logger.info(
-        f"{hue.y}probe config:{hue.q} "
-        f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, "
-        f"nodes={hue.m}{N}{hue.q}, channels={hue.m}{C}{hue.q}, "
-        f"schedule_rollout={hue.m}{reachable_rollout}{hue.q}/{hue.m}{min(args.max_rollout_steps, T - 1)}{hue.q}, "
-        f"params={hue.m}{total_params}{hue.q}"
-    )
-
+    B, T, N, C = train_batch[0].shape
+    total_params = sum(p.numel() for p in trainer.model.parameters())
     peak = torch.cuda.max_memory_allocated(device)
-    total = torch.cuda.get_device_properties(device).total_memory
-    pct = 100.0 * peak / total
+    total_mem = torch.cuda.get_device_properties(device).total_memory
+    pct = 100.0 * peak / total_mem
+
     if pct < 75.0:
         status = f"{hue.g}SAFE{hue.q}"
     elif pct < 92.0:
@@ -388,18 +319,34 @@ def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
     else:
         status = f"{hue.r}CRITICAL - likely OOM in real training{hue.q}"
 
-    logger.info(f"{hue.y}device: {hue.b}{torch.cuda.get_device_name(device)}{hue.q} ({hue.m}{total / 1e9:.1f}{hue.q} GB)")
-    logger.info(f"{hue.y}peak usage: {hue.m}{peak / 1e9:.2f}{hue.q} GB ({hue.m}{pct:.1f}{hue.q} %) -> {status}")
-    logger.info(f"{hue.y}train eta: {hue.m}{total_seconds / 3600.0:.1f}{hue.q} h -> {hue.b}{finish_at.strftime('%m-%d %H:%M')}{hue.q}")
+    logger.info(
+        f"{hue.y}probe config:{hue.q} "
+        f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, "
+        f"nodes={hue.m}{N}{hue.q}, channels={hue.m}{C}{hue.q}, "
+        f"rollout={hue.m}{reachable_rollout}{hue.q}/{hue.m}{min(args.max_rollout_steps, T - 1)}{hue.q}, "
+        f"params={hue.m}{total_params}{hue.q}"
+    )
+    logger.info(
+        f"{hue.y}device:{hue.q} {hue.b}{torch.cuda.get_device_name(device)}{hue.q} "
+        f"({hue.m}{total_mem / 1e9:.1f}{hue.q} GB)"
+    )
+    logger.info(
+        f"{hue.y}peak usage:{hue.q} {hue.m}{peak / 1e9:.2f}{hue.q} GB "
+        f"({hue.m}{pct:.1f}{hue.q} %) -> {status}"
+    )
+    logger.info(
+        f"{hue.y}train eta:{hue.q} {hue.m}{total_seconds / 3600.0:.1f}{hue.q} h "
+        f"-> {hue.b}{finish_at.strftime('%m-%d %H:%M')}{hue.q}"
+    )
     logger.info(f"{hue.g}============================== [PROBE PIPELINE] END ==============================={hue.q}")
 
 
 def train_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) -> None:
     """
-    Execute the training workflow.
+    Run the training workflow.
 
     Args:
-        args (Any): Parsed command-line arguments.
+        args (Any): Parsed arguments.
         train_loader (DataLoader): Training loader.
         val_loader (DataLoader): Validation loader.
     """
@@ -408,13 +355,30 @@ def train_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model, model_args = build_model(args=args)
-    params = {"model_args": model_args, "channel_names": args.channel_names}
-    scalers = {"state_scaler": args.state_scaler, "coord_scaler": args.coord_scaler}
-    total_params = sum(p.numel() for p in model.parameters())
+    ref_coords = train_loader.dataset[0][1]
+    adj_indices, adj_values, edge_index = build_local_graph(
+        coords=ref_coords,
+        k=args.graph_k,
+        sigma_scale=args.graph_sigma_scale,
+    )
+    model, model_args = build_model(
+        args=args,
+        adj_indices=adj_indices,
+        adj_values=adj_values,
+        edge_index=edge_index,
+    )
+    params = {
+        "channel_names": args.channel_names,
+        "model_args": model_args,
+        "graph_k": args.graph_k,
+        "graph_sigma_scale": args.graph_sigma_scale,
+    }
+    scalers = {
+        "state_scaler": args.state_scaler,
+        "coord_scaler": args.coord_scaler,
+    }
 
-    logger.info(f"train model with {hue.m}{total_params}{hue.q} parameters")
-
+    logger.info(f"train model with {hue.m}{sum(p.numel() for p in model.parameters())}{hue.q} parameters")
     trainer = build_trainer(args, model, params, scalers, output_dir)
     trainer.fit(train_loader, val_loader)
 
@@ -423,10 +387,10 @@ def train_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
 
 def infer_pipeline(args: Any, test_data: FlowData) -> None:
     """
-    Execute the inference workflow.
+    Run the inference workflow.
 
     Args:
-        args (Any): Parsed command-line arguments.
+        args (Any): Parsed arguments.
         test_data (FlowData): Raw test dataset.
     """
     logger.info(f"{hue.c}=========================== [INFERENCE PIPELINE] START ============================ {hue.q}")
@@ -435,9 +399,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = output_dir / "ckpt.pt"
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    checkpoint = torch.load(output_dir / args.checkpoint_name, map_location=device, weights_only=True)
     params = checkpoint["params"]
     scaler_state = checkpoint["scaler_state_dict"]
 
@@ -446,7 +408,18 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
     coord_scaler = MinMaxScalerTensor(norm_range="bipolar")
     coord_scaler.load_state_dict(scaler_state["coord_scaler"])
 
-    model, _ = build_model(model_args=params["model_args"])
+    ref_coords = coord_scaler.transform(test_data.coords[0])
+    adj_indices, adj_values, edge_index = build_local_graph(
+        coords=ref_coords,
+        k=params["graph_k"],
+        sigma_scale=params["graph_sigma_scale"],
+    )
+    model, _ = build_model(
+        model_args=params["model_args"],
+        adj_indices=adj_indices,
+        adj_values=adj_values,
+        edge_index=edge_index,
+    )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
@@ -460,11 +433,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
     focus_channel_idx = channel_names.index("Vy")
     focus_bbox_rel = (0.60, 1.00, 0.00, 1.00) if args.spatial_dim == 2 else (0.60, 1.00, 0.00, 1.00, 0.00, 1.00)
 
-    for seq, coords, label in zip(
-        test_data.seqs,
-        test_data.coords,
-        test_data.labels,
-    ):
+    for seq, coords, label in zip(test_data.seqs, test_data.coords, test_data.labels):
         gt_seq = seq.cpu()
         coords_raw = coords.cpu()
         label_raw = label.cpu()
@@ -479,7 +448,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
             coords=coords_norm,
             steps=gt_seq.shape[0] - 1,
         )
-        pred_seq = state_scaler.inverse_transform(pred_std).cpu().squeeze(0)
+        pred_seq = state_scaler.inverse_transform(pred_std).squeeze(0).cpu()
         case_metrics = metrics.compute(pred_seq, gt_seq)
         metrics_bank[label_name] = case_metrics
 
@@ -494,7 +463,6 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
                 f"NMSE={hue.m}{global_metrics['nmse']:.2e}{hue.q}, "
                 f"R2={hue.m}{global_metrics['r2']:.4f}{hue.q}"
             )
-
         logger.info(f"label {hue.b}{label_name}{hue.q} | " + " | ".join(logs))
 
         visualizer.render_full(
