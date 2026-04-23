@@ -2,109 +2,65 @@
 
 ## Project Snapshot
 
-- HyperFlowNet is the irregular-mesh CFD task repository in the WSNet family.
-- The current scope is fixed-mesh autoregressive flow prediction on a shared 2D unstructured mesh.
-- Keep this repository focused on task-facing code: data ingestion, rollout training, inference, visualization, and fast local model iteration.
+- HyperFlowNet is `HyperFlowNet: A Spatio-Temporal Neural Operator for Shock-Wave Flow Simulation`.
+- It is the transient CFD task repository in the WSNet family.
+- The current default workflow is autoregressive shock-wave flow prediction on unstructured mesh.
+- Keep this repository focused on task-facing code: data ingestion, rollout training, inference, visualization, metrics, and fast local model iteration.
+- Treat the current repository code as the source of truth when older notes, slides, reports, or README text disagree with it.
 
-## Canonical Sources of Truth
+## Active Code Path
 
-- Treat the current repository code as the source of truth when notes, slides, or older reports disagree with it.
-- The active execution path is `main.py -> FlowData / BoundaryCondition -> HyperFlowTrainer -> HyperFlowNet -> FlowVis`.
-- `config.py` is the canonical place for current default experiment knobs.
-- Some older internal documents describe Geo-FNO-era designs or older hyperparameters. Do not assume those documents match the present implementation.
+- The active workflow is `main.py -> FlowData -> HyperFlowTrainer -> HyperFlowNet -> Metrics / FlowVis`.
+- `config.py` is the canonical source for default command-line options and experiment knobs.
+- Keep agent notes limited to modules and mechanisms that exist in the current repository code.
 
-## Dataset Mental Model
+## Dataset Contract
 
-- The current dataset contains 19 cached transient CFD cases.
-- Each case uses the same fixed 2D mesh and stores:
-  - `states`: `(1001, 9617, 4)` float32
-  - `coords`: `(9617, 2)` float32
-- Coordinates are identical across all current cases.
-- The approximate coordinate box is:
-  - `x in [-0.213, 3.578]`
-  - `y in [0.000, 0.578]`
-- The channel order after ingestion is always `[Vx, Vy, P, T]`.
-- The geometry is a chamber-pipe-chamber style layout with a long narrow connecting section. High activity is concentrated along the pipe and chamber-transition regions.
-- Cases differ by operating condition / boundary condition, not by mesh topology.
-- In the current cached dataset, coordinates are identical across cases, but this is a dataset fact, not a long-term architectural law.
-- Prefer designs that remain compatible with different coordinates for different cases or operating conditions, as long as that compatibility does not add unnecessary complexity to the current code.
-- This is an extreme-pressure-ratio transient-flow problem with sharp local structures and long autoregressive horizons.
-- Pressure dominates the raw magnitude scale by orders of magnitude. Reason in standardized feature space during training, rollout, and boundary enforcement.
-- Wall nodes are detected from near-zero velocity over all timesteps. On the full current cache, this is about 1.3k of 9.6k nodes, but every real run should still fit the wall mask from the training split only.
-- With the current 19-case cache and the default `FlowData.spawn()` behavior, the split is 16 train / 2 val / 1 test under seed 42, with full-rollout evaluation on `case_4500`. Treat that as the current default, not an eternal assumption.
+- `FlowData.discover_cases()` finds root-level `case_*.pt` files and `raw_data/case_*` directories.
+- Cached cases are PyTorch dictionaries with `states` and `coords`.
+- The default workflow uses 2D states with channel order `[Vx, Vy, P, T]` and coordinates shaped `(N, 2)`.
+- Raw 2D Fluent-style rows are parsed as `[Index, x, y, P, Vx, Vy, T]` and cached as `[Vx, Vy, P, T]`.
+- `FlowData` has a 3D parsing branch, but the current default `main.py` workflow and `initial_state_from_label()` are 2D / four-channel oriented. Do not describe 3D as a validated full workflow unless the code is updated.
+- Case labels are parsed from the numeric suffix in names such as `case_4500`.
+- Train and validation cases are augmented with sliding temporal windows. Test cases keep full sequences for rollout evaluation.
+- The default split behavior is deterministic under seed 42, with `split_counts=(2, 1)` for validation and test case counts.
+
+## Preprocessing And Runtime Flow
+
+- `data_pipeline()` fits `StandardScalerTensor` on training states and `MinMaxScalerTensor(norm_range="bipolar")` on training coordinates.
+- Training and validation batches contain standardized `seq`, normalized `coords`, `t0_norm`, and `dt_norm`. Labels are not passed into the trainer.
+- Probe and train build one local graph from the first normalized training coordinate set.
+- Inference loads `ckpt.pt`, restores saved scalers and model parameters, builds one local graph from the first test coordinate set, constructs the initial physical state with `initial_state_from_label()`, then calls `model.predict()`.
+- Inference writes `<label>_pred.pt`, `metrics.json`, and MP4 visualizations through `FlowVis`.
+- The current graph is a fixed reference graph per run. Do not claim moving-mesh, variable-cardinality, or per-case graph rebuilding support unless the implementation changes.
+
+## Model And Trainer Contract
+
+- `build_local_graph()` constructs a kNN sparse local operator and an undirected edge list from normalized coordinates.
+- `HyperFlowNet` is the local spatio-temporal neural operator implementation. It predicts one next state from `(inputs, coords, t_norm)` and returns `(pred_state, weight_bank)`.
+- The model combines current node states, learnable Fourier coordinate encoding, sinusoidal time encoding, frontier-aware slice attention, and residual feed-forward blocks.
+- `HyperFlowTrainer` uses AdamW, cosine annealing, channel-weighted NMSE, autoregressive rollout loss, rollout noise injection during training, and frontier regularization from early slice assignments.
+- Rollout curriculum advances by `rollout_patience` and `max_rollout_steps`, not by validation-loss triggers.
+- Validation loss is computed through the same rollout loss path with model evaluation mode and no injected noise.
 
 ## WSNet Relationship
 
 - WSNet is the reusable upstream for mature shared infrastructure.
-- `training/base_trainer.py` and `utils/*` should be treated as mature shared scripts. Do not casually redesign or fork them inside HyperFlowNet.
-- If a real shared-infrastructure fix is needed for `base_trainer` or `utils`, the preferred workflow is:
-  - make or finalize the change in WSNet
-  - then sync HyperFlowNet deliberately
-- `models/hflownet.py` is the main exception:
-  - fast model iteration is allowed and expected in HyperFlowNet first
-  - once the model change is validated here, sync or back-port it to WSNet on purpose
-- `training/hyperflow_trainer.py`, `data/*`, `main.py`, and visualization logic are HyperFlowNet-local and should evolve directly in this repository.
-
-## Design Philosophy
-
-- Optimize for simple, clear, tidy code.
-- Prefer a direct implementation over an abstract one unless abstraction clearly removes real pain.
-- Avoid unnecessary new classes, wrappers, managers, or indirection layers.
-- Keep the training stack centered on `training/base_trainer.py`.
-- All trainer classes should inherit from `training/base_trainer.py`.
-- In normal cases, a trainer should only need:
-  - a small task-specific `__init__`
-  - `_compute_loss`
-  - optional use of `_on_epoch_start` and `_on_epoch_end`
-- Reuse the built-in hooks instead of building parallel callback systems unless there is a compelling reason.
-
-## Algorithmic Priorities
-
-- This is a shock-sensitive transient-flow problem. Accurate shock localization / identification matters.
-- Favor learnable mechanisms that can represent sharp local structures on irregular meshes.
-- This is also a long-horizon autoregressive problem. Stability over rollout is a first-class objective, not a secondary metric.
-- The current winning training prior is pure rollout plus noise injection.
-- Do not quietly fall back to mostly one-step supervision, weak teacher forcing, or curriculum logic that ignores rollout behavior.
-- Noise injection is part of the training recipe, not a cosmetic detail. It reduces the training-inference mismatch and should remain visible in trainer design.
-- Because the trainer injects noise, validation loss is useful but not sacred.
-- Curriculum updates should be driven by rollout difficulty, rollout-step schedule, or explicit rollout-oriented signals, not by raw validation loss alone.
-- Hard wall boundary enforcement is part of the rollout design. Preserve it unless there is a strong replacement with clearly better behavior.
+- Treat `training/base_trainer.py` and `utils/*` as mature WSNet-style shared scripts. Do not casually redesign or fork them inside HyperFlowNet.
+- If a real shared-infrastructure fix is needed for `base_trainer` or `utils`, the preferred workflow is to make or finalize the change in WSNet, then sync HyperFlowNet deliberately.
+- `models/hflownet.py` is the main local fast-iteration area. Once a model change is validated here, sync or back-port it to WSNet on purpose.
+- `main.py`, `config.py`, `data/*`, `training/hflow_trainer.py`, and visualization logic are HyperFlowNet-local and should evolve directly in this repository.
 
 ## Practical Change Strategy
 
-- When changing the model, tie the change to one of the real project needs:
-  - better shock capture
-  - better long-rollout stability
-  - better geometry encoding on irregular meshes
-  - better channel coupling
-  - better boundary handling
-- When changing the trainer, protect the pure-rollout + noise path first.
+- Keep code and documents aligned with the active implementation.
 - When changing the data pipeline, preserve the semantic contract:
-  - raw or cached states end up in `[Vx, Vy, P, T]`
+  - raw or cached default states end up in `[Vx, Vy, P, T]`
   - feature scaling is channel-wise standardization
-  - coordinate scaling is min-max to `[-1, 1]`
+  - coordinate scaling is min-max normalization to `[-1, 1]`
+  - train / validation use sliding windows
   - test data keeps full sequences for long-rollout evaluation
-- When code and older notes, reports, or process documents disagree, treat the current code as the primary reference for present behavior.
-- Do not rewrite historical or process-tracking documents just to force consistency with the latest code.
-- When writing new technical documents, slides, or papers about the current implementation, prefer the code over older documents.
-
-## What Usually Belongs Where
-
-- Keep in HyperFlowNet:
-  - `main.py`
-  - `config.py`
-  - `data/*`
-  - `training/hyperflow_trainer.py`
-  - `models/hflownet.py` during active architecture iteration
-  - rollout diagnostics and visualization
-- Keep in WSNet:
-  - mature shared utilities
-  - reusable trainer-base behavior
-  - stable model implementations that are ready to serve as family-wide upstream code
-
-## Non-Goals
-
-- Do not add moving-mesh or variable-cardinality machinery before the project truly needs it.
-- Do not hard-code the assumption that all cases must share identical coordinates just because the current cached dataset does.
-- Do not overfit the design around validation-loss cosmetics.
+- When changing the trainer, protect the rollout + noise-injection path first.
+- When changing the model, keep the reference-graph assumption explicit unless graph rebuilding is implemented end to end.
+- Avoid adding moving-mesh or variable-cardinality machinery before the project truly needs it.
 - Do not split the trainer into many thin near-empty subclasses when one subclass plus the existing hooks is enough.
