@@ -15,6 +15,7 @@ import config
 from data.flow_data import FlowData
 from data.flow_metrics import Metrics
 from data.flow_vis import FlowVis
+from data.flow_twin import FlowTwin
 from data.initial_state import initial_state_from_label
 from models.hflownet import HyperFlowNet, build_local_graph
 from training.hflow_trainer import HyperFlowTrainer
@@ -427,6 +428,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
     channel_names = params["channel_names"]
     total_params = sum(p.numel() for p in model.parameters())
     visualizer = FlowVis(output_dir=output_dir, spatial_dim=args.spatial_dim, channel_names=channel_names)
+    flow_twin = FlowTwin(output_dir=output_dir, channel_names=channel_names)
     metrics = Metrics(channel_names)
     metrics_bank = {}
 
@@ -482,6 +484,13 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
             num_params=total_params,
             focus_channel_idx=focus_channel_idx,
             focus_bbox_rel=focus_bbox_rel,
+        )
+        flow_twin.render(
+            pred=pred_seq,
+            coords=coords_raw,
+            label=label_name,
+            num_nodes=int(coords_raw.shape[0]),
+            num_params=total_params,
         )
 
     with open(output_dir / "metrics.json", "w") as f:
