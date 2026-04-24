@@ -95,6 +95,32 @@ class FlowTwin:
         section.points = points
         return section
 
+    def _full_section_mesh(self, mesh: pv.PolyData) -> pv.PolyData:
+        """
+        Mirror one radial section into a full-diameter section.
+
+        Args:
+            mesh (pv.PolyData): One-sided axisymmetric section mesh.
+
+        Returns:
+            pv.PolyData: Full-diameter section mesh.
+        """
+        points = mesh.points.copy()
+        mirrored_points = points.copy()
+        mirrored_points[:, 1] *= -1.0
+
+        faces = mesh.faces.reshape(-1, 4)
+        mirrored_faces = faces.copy()
+        mirrored_faces[:, 1:] += points.shape[0]
+        mirrored_faces[:, [2, 3]] = mirrored_faces[:, [3, 2]]
+
+        section = pv.PolyData(
+            np.vstack([points, mirrored_points]),
+            np.vstack([faces, mirrored_faces]).ravel(),
+        )
+        section.point_data["node_id"] = np.concatenate([mesh.point_data["node_id"], mesh.point_data["node_id"]])
+        return section
+
     def _pipe_shell(self, mesh: pv.PolyData) -> pv.PolyData:
         """
         Revolve the section boundary by 360 degrees to build the pipe shell.
@@ -133,14 +159,14 @@ class FlowTwin:
 
         plotter.camera.focal_point = (cx, cy, cz)
         plotter.camera.position = (
-            cx + 0.48 * length,
-            cy - 2.30 * diameter,
-            cz + 1.25 * diameter,
+            cx + 1.20 * length,
+            cy - 2.45 * diameter,
+            cz + 1.15 * diameter,
         )
         plotter.camera.up = (0.0, 0.0, 1.0)
-        plotter.camera.view_angle = 24.0
+        plotter.camera.view_angle = 26.0
         plotter.camera.parallel_projection = False
-        plotter.camera.zoom(1.18)
+        plotter.camera.zoom(0.84)
         plotter.reset_camera_clipping_range()
 
     # ============================================================
@@ -252,10 +278,12 @@ class FlowTwin:
             f"pad={W_enc}:{H_enc}:0:0",
             "-c:v",
             "libx264",
+            "-preset",
+            "slow",
             "-pix_fmt",
             "yuv420p",
             "-crf",
-            "22",
+            "16",
             str(out_path),
         ]
         proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -300,38 +328,38 @@ class FlowTwin:
 
         points = self._section_points(coords)
         section_2d = self._section_mesh(points)
-        section_ids = section_2d.point_data["node_id"].astype(np.int64)
-        section = self._rotate_section(section_2d)
+        section_full = self._full_section_mesh(section_2d)
+        section_ids = section_full.point_data["node_id"].astype(np.int64)
+        section = self._rotate_section(section_full)
         shell = self._pipe_shell(section_2d)
-        shell_ids = shell.point_data["node_id"].astype(np.int64)
 
         section.point_data["scalar"] = field[0, section_ids]
-        shell.point_data["scalar"] = field[0, shell_ids]
 
         plotter = pv.Plotter(off_screen=True, window_size=(1920, 1080))
         plotter.set_background("white")
-        plotter.enable_anti_aliasing("ssaa")
+        plotter.enable_anti_aliasing("msaa", multi_samples=8)
         plotter.add_mesh(
             shell,
-            scalars="scalar",
-            cmap=cmap,
-            clim=clim,
-            opacity=0.42,
+            color=(0.60, 0.62, 0.64),
+            opacity=0.24,
             smooth_shading=True,
             show_scalar_bar=False,
+            specular=0.25,
+            specular_power=18,
         )
         plotter.add_mesh(
             section,
             scalars="scalar",
             cmap=cmap,
             clim=clim,
+            lighting=False,
             smooth_shading=True,
             scalar_bar_args=self._sbar_args(channel_name),
         )
 
         title = f"HyperFlowNet (nodes: {num_nodes:,}, params: {num_params:,})"
         plotter.add_text(title, position="upper_edge", font_size=15, color="black")
-        plotter.add_text(channel_name, position="upper_left", font_size=18, color="black")
+        plotter.add_text(f"{channel_name} (label {label})", position="upper_left", font_size=18, color="black")
 
         light = pv.Light(position=(2.0, -3.0, 3.0), focal_point=(0.0, 0.0, 0.0), color="white", intensity=0.8)
         plotter.add_light(light)
@@ -339,7 +367,6 @@ class FlowTwin:
 
         def _update(step_idx: int) -> None:
             section.point_data["scalar"] = field[step_idx, section_ids]
-            shell.point_data["scalar"] = field[step_idx, shell_ids]
 
         out_path = self.output_dir / f"{label}_twin_{channel_name.lower()}.mp4"
         self._mp4(plotter, _update, field.shape[0], out_path, desc=f"Rendering {label} 3D twin")
