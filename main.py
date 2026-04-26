@@ -49,14 +49,16 @@ def build_model(
             "in_channels": len(args.channel_names),
             "out_channels": len(args.channel_names),
             "spatial_dim": args.spatial_dim,
+            "graph_mode": args.graph_mode,
             "width": args.width,
             "depth": args.depth,
             "num_slices": args.num_slices,
             "num_heads": args.num_heads,
-            "frontier_beta": args.frontier_beta,
             "coord_features": args.coord_features,
             "time_features": args.time_features,
             "freq_base": args.freq_base,
+            "graph_beta_init": args.graph_beta_init,
+            "graph_bias_eps": args.graph_bias_eps,
         }
 
     model = HyperFlowNet(
@@ -103,12 +105,6 @@ def build_trainer(
         noise_std_init=args.noise_std_init,
         noise_decay=args.noise_decay,
         channel_weights=args.channel_weights,
-        frontier_blocks=args.frontier_blocks,
-        frontier_q_low=args.frontier_q_low,
-        frontier_q_high=args.frontier_q_high,
-        frontier_margin=args.frontier_margin,
-        lambda_smooth=args.lambda_smooth,
-        lambda_frontier=args.lambda_frontier,
     )
 
 

@@ -66,6 +66,9 @@ def get_args() -> argparse.Namespace:
 
     hflownet = parser.add_argument_group("HyperFlowNet")
     hflownet.add_argument(
+        "--graph_mode", type=str, default="bias", choices=["bias", "assign"], help="Graph injection mode."
+    )
+    hflownet.add_argument(
         "--depth", type=int, default=4, help="Number of stacked HyperFlowNet blocks."
     )
     hflownet.add_argument(
@@ -78,15 +81,6 @@ def get_args() -> argparse.Namespace:
         "--num_heads", type=int, default=8, help="Number of slice-space attention heads."
     )
     hflownet.add_argument(
-        "--frontier_beta", type=float, default=1.0, help="Frontier contrast strength in slice assignment."
-    )
-    hflownet.add_argument(
-        "--graph_k", type=int, default=8, help="Number of nearest neighbors in the local graph."
-    )
-    hflownet.add_argument(
-        "--graph_sigma_scale", type=float, default=1.5, help="Distance scale multiplier of graph weights."
-    )
-    hflownet.add_argument(
         "--coord_features", type=int, default=8, help="Half-dimension of Fourier spatial encoding."
     )
     hflownet.add_argument(
@@ -97,7 +91,25 @@ def get_args() -> argparse.Namespace:
     )
 
     # ============================================================
-    # 4. Trainer
+    # 4. Graph
+    # ============================================================
+
+    graph = parser.add_argument_group("Graph")
+    graph.add_argument(
+        "--graph_k", type=int, default=12, help="Number of nearest neighbors in the local graph."
+    )
+    graph.add_argument(
+        "--graph_sigma_scale", type=float, default=1.5, help="Distance scale multiplier of graph weights."
+    )
+    graph.add_argument(
+        "--graph_beta_init", type=float, default=0.13, help="Initial graph bias strength."
+    )
+    graph.add_argument(
+        "--graph_bias_eps", type=float, default=1e-6, help="Small graph bias stabilizer."
+    )
+
+    # ============================================================
+    # 5. Trainer
     # ============================================================
 
     trainer = parser.add_argument_group("Trainer")
@@ -116,27 +128,9 @@ def get_args() -> argparse.Namespace:
     trainer.add_argument(
         "--channel_weights", type=float, nargs="+", default=[1.0, 3.0, 1.0, 1.0], help="Per-channel loss weights."
     )
-    trainer.add_argument(
-        "--frontier_blocks", type=int, default=3, help="Number of regularized early blocks."
-    )
-    trainer.add_argument(
-        "--frontier_q_low", type=float, default=0.25, help="Low contrast quantile."
-    )
-    trainer.add_argument(
-        "--frontier_q_high", type=float, default=0.75, help="High contrast quantile."
-    )
-    trainer.add_argument(
-        "--frontier_margin", type=float, default=0.10, help="Allowed frontier overlap."
-    )
-    trainer.add_argument(
-        "--lambda_smooth", type=float, default=0.05, help="Weight of L_smooth."
-    )
-    trainer.add_argument(
-        "--lambda_frontier", type=float, default=0.05, help="Weight of L_frontier."
-    )
 
     # ============================================================
-    # 5. Curriculum
+    # 6. Curriculum
     # ============================================================
 
     curriculum = parser.add_argument_group("Curriculum")

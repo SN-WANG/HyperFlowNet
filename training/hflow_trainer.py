@@ -44,8 +44,7 @@ class NMSECriterion(nn.Module):
             Tensor: Scalar NMSE loss. ().
         """
         C = pred.shape[-1]
-        sq_err = (target - pred).square()
-        mse_c = sq_err.reshape(-1, C).sum(dim=0)
+        mse_c = (target - pred).square().reshape(-1, C).sum(dim=0)
         norm_c = target.square().reshape(-1, C).sum(dim=0).clamp_min(self.eps)
         nmse_c = mse_c / norm_c
 
@@ -58,7 +57,7 @@ class NMSECriterion(nn.Module):
 
 class HyperFlowTrainer(BaseTrainer):
     """
-    Rollout trainer for HyperFlowNet, a spatio-temporal neural operator for shock-wave flow simulation.
+    Rollout trainer for HyperFlowNet shock-wave flow prediction.
     """
 
     def __init__(
@@ -73,19 +72,13 @@ class HyperFlowTrainer(BaseTrainer):
         noise_std_init: float = 0.01,
         noise_decay: float = 0.7,
         channel_weights: Optional[list[float]] = None,
-        frontier_blocks: int = 3,
-        frontier_q_low: float = 0.25,
-        frontier_q_high: float = 0.75,
-        frontier_margin: float = 0.10,
-        lambda_smooth: float = 0.05,
-        lambda_frontier: float = 0.05,
         **kwargs,
     ) -> None:
         """
         Initialize the HyperFlowNet rollout trainer.
 
         Args:
-            model (nn.Module): HyperFlowNet model for shock-wave flow simulation.
+            model (nn.Module): HyperFlowNet model.
             lr (float): AdamW learning rate.
             max_epochs (int): Number of training epochs.
             weight_decay (float): AdamW weight decay.
@@ -95,12 +88,6 @@ class HyperFlowTrainer(BaseTrainer):
             noise_std_init (float): Initial rollout noise standard deviation.
             noise_decay (float): Multiplicative rollout noise decay.
             channel_weights (Optional[list[float]]): Optional channel weights. (C,).
-            frontier_blocks (int): Number of early blocks used by frontier losses.
-            frontier_q_low (float): Smooth-edge quantile.
-            frontier_q_high (float): Frontier-edge quantile.
-            frontier_margin (float): Allowed assignment overlap on frontier edges.
-            lambda_smooth (float): Weight of L_smooth.
-            lambda_frontier (float): Weight of L_frontier.
             **kwargs: Arguments forwarded to BaseTrainer.
         """
         optimizer = kwargs.pop("optimizer", None)
@@ -128,13 +115,6 @@ class HyperFlowTrainer(BaseTrainer):
         self.rollout_patience = rollout_patience
         self.noise_std_init = noise_std_init
         self.noise_decay = noise_decay
-
-        self.frontier_blocks = frontier_blocks
-        self.frontier_q_low = frontier_q_low
-        self.frontier_q_high = frontier_q_high
-        self.frontier_margin = frontier_margin
-        self.lambda_smooth = lambda_smooth
-        self.lambda_frontier = lambda_frontier
 
         self.current_rollout_steps = 1
         self.current_noise_std = noise_std_init
@@ -167,51 +147,9 @@ class HyperFlowTrainer(BaseTrainer):
         """
         self._update_curriculum()
 
-    def _compute_cluster_loss(self, weight_bank: list[Tensor], state: Tensor) -> Tensor:
-        """
-        Compute L_smooth and L_frontier from early slice assignments.
-
-        Args:
-            weight_bank (list[Tensor]): Slice assignments from all blocks. Each (B, N, S).
-            state (Tensor): Standardized target state. (B, N, C).
-
-        Returns:
-            Tensor: Scalar cluster regularization loss. ().
-        """
-        if self.lambda_smooth <= 0.0 and self.lambda_frontier <= 0.0:
-            return state.new_zeros(())
-
-        edge_index = self.model.edge_index
-        src, dst = edge_index[0], edge_index[1]
-        contrast = (state[:, src, :] - state[:, dst, :]).abs().sum(dim=-1)
-        low = torch.quantile(contrast, self.frontier_q_low, dim=1, keepdim=True)
-        high = torch.quantile(contrast, self.frontier_q_high, dim=1, keepdim=True)
-        smooth_mask = contrast <= low
-        frontier_mask = contrast >= high
-
-        num_blocks = min(self.frontier_blocks, len(weight_bank))
-        if num_blocks == 0:
-            return state.new_zeros(())
-
-        block_losses = []
-        for block_idx in range(num_blocks):
-            weights = weight_bank[block_idx]
-            p_src = weights[:, src, :]
-            p_dst = weights[:, dst, :]
-
-            smooth_dist = (p_src - p_dst).square().sum(dim=-1)
-            overlap = (p_src * p_dst).sum(dim=-1)
-            frontier_penalty = torch.relu(overlap - self.frontier_margin)
-
-            smooth_loss = (smooth_dist * smooth_mask).sum() / smooth_mask.sum().clamp_min(1.0)
-            frontier_loss = (frontier_penalty * frontier_mask).sum() / frontier_mask.sum().clamp_min(1.0)
-            block_losses.append(self.lambda_smooth * smooth_loss + self.lambda_frontier * frontier_loss)
-
-        return torch.stack(block_losses).mean()
-
     def _compute_loss(self, batch: Any) -> Tensor:
         """
-        Compute weighted rollout loss with frontier regularization.
+        Compute weighted autoregressive rollout NMSE.
 
         Args:
             batch (Any): Batch tuple or list of (seq, coords, t0_norm, dt_norm).
@@ -232,15 +170,11 @@ class HyperFlowTrainer(BaseTrainer):
                 step_input = step_input + self.current_noise_std * torch.randn_like(step_input)
 
             step_t_norm = t0_norm + step_idx * dt_norm
-            pred_state, weight_bank = self.model(step_input, coords, step_t_norm)
+            pred_state = self.model(step_input, coords, t_norm=step_t_norm)
             target_state = seq[:, step_idx + 1]
 
-            rollout_loss = self.criterion(pred_state, target_state)
-            cluster_loss = self._compute_cluster_loss(weight_bank, target_state)
-            step_loss = rollout_loss + cluster_loss
-
-            weight = 2.0 * (step_idx + 1) / total_weight
-            loss = loss + weight * step_loss
+            step_weight = 2.0 * (step_idx + 1) / total_weight
+            loss = loss + step_weight * self.criterion(pred_state, target_state)
             input_state = pred_state
 
         return loss
