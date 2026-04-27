@@ -120,7 +120,7 @@ def get_args() -> argparse.Namespace:
         "--weight_decay", type=float, default=1e-4, help="AdamW weight decay."
     )
     trainer.add_argument(
-        "--max_epochs", type=int, default=560, help="Maximum training epochs."
+        "--max_epochs", type=int, default=700, help="Maximum training epochs."
     )
     trainer.add_argument(
         "--eta_min", type=float, default=1e-6, help="Minimum learning rate for cosine annealing."
