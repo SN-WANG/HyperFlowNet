@@ -175,6 +175,7 @@ class GraphBiasAttention(nn.Module):
         num_heads: int,
         graph_beta_init: float = 0.13,
         graph_bias_eps: float = 1e-6,
+        shock: bool = False,
     ) -> None:
         """
         Initialize graph-biased slice attention.
@@ -185,6 +186,7 @@ class GraphBiasAttention(nn.Module):
             num_heads (int): Number of slice-space attention heads.
             graph_beta_init (float): Initial graph bias strength.
             graph_bias_eps (float): Small bias stabilizer.
+            shock (bool): Whether to use shock-aware graph bias.
         """
         super().__init__()
         if width % num_heads != 0:
@@ -193,6 +195,7 @@ class GraphBiasAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = width // num_heads
         self.graph_bias_eps = graph_bias_eps
+        self.shock = shock
 
         self.slice_proj = nn.Linear(width, num_slices)
         self.q_proj = nn.Linear(width, width)
@@ -200,6 +203,8 @@ class GraphBiasAttention(nn.Module):
         self.v_proj = nn.Linear(width, width)
         self.out_proj = nn.Linear(width, width)
         self.beta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(graph_beta_init)), dtype=torch.float32))
+        if shock:
+            self.shock_proj = nn.Linear(width, 1)
 
     def forward(self, x: Tensor, adj_indices: Tensor, adj_values: Tensor) -> Tensor:
         """
@@ -220,9 +225,17 @@ class GraphBiasAttention(nn.Module):
         weight_sum = weights.sum(dim=1, keepdim=True).transpose(1, 2).clamp_min(self.graph_bias_eps)
         slices = torch.bmm(weights.transpose(1, 2), x) / weight_sum
 
-        graph_weights = sparse_graph_aggregate(adj_indices, adj_values, weights)
+        if self.shock:
+            x_graph = sparse_graph_aggregate(adj_indices, adj_values, x)
+            shock_gate = F.softplus(self.shock_proj(x - x_graph))
+            shock_gate = shock_gate / shock_gate.mean(dim=1, keepdim=True).clamp_min(self.graph_bias_eps)
+            graph_weights = sparse_graph_aggregate(adj_indices, adj_values, shock_gate * weights)
+        else:
+            graph_weights = sparse_graph_aggregate(adj_indices, adj_values, weights)
+
         graph_bias = torch.bmm(weights.transpose(1, 2), graph_weights)
-        graph_bias = 0.5 * (graph_bias + graph_bias.transpose(1, 2))
+        if not self.shock:
+            graph_bias = 0.5 * (graph_bias + graph_bias.transpose(1, 2))
         graph_bias = graph_bias / graph_bias.sum(dim=-1, keepdim=True).clamp_min(self.graph_bias_eps)
         graph_bias = torch.log(graph_bias.clamp_min(self.graph_bias_eps))
 
@@ -243,7 +256,7 @@ class GraphAssignAttention(nn.Module):
     Slice attention with graph structure injected into node-to-slice assignment.
     """
 
-    def __init__(self, width: int, num_slices: int, num_heads: int) -> None:
+    def __init__(self, width: int, num_slices: int, num_heads: int, shock: bool = False) -> None:
         """
         Initialize graph-aware assignment attention.
 
@@ -251,13 +264,18 @@ class GraphAssignAttention(nn.Module):
             width (int): Node token width.
             num_slices (int): Number of slice tokens.
             num_heads (int): Number of slice-space attention heads.
+            shock (bool): Whether to use shock-aware assignment features.
         """
         super().__init__()
+        self.shock = shock
         self.assign_self = nn.Linear(width, width)
         self.assign_graph = nn.Linear(width, width, bias=False)
         self.assign_norm = nn.LayerNorm(width)
         self.slice_proj = nn.Linear(width, num_slices)
         self.attn = nn.MultiheadAttention(embed_dim=width, num_heads=num_heads, batch_first=True)
+        if shock:
+            self.shock_proj = nn.Linear(width, 1)
+            self.assign_shock = nn.Linear(width, width, bias=False)
 
     def forward(self, x: Tensor, adj_indices: Tensor, adj_values: Tensor) -> Tensor:
         """
@@ -272,7 +290,14 @@ class GraphAssignAttention(nn.Module):
             Tensor: Node update. (B, N, C).
         """
         x_graph = sparse_graph_aggregate(adj_indices, adj_values, x)
-        assign = F.gelu(self.assign_norm(self.assign_self(x) + self.assign_graph(x_graph)))
+        assign_input = self.assign_self(x) + self.assign_graph(x_graph)
+        if self.shock:
+            x_res = x - x_graph
+            shock_gate = F.softplus(self.shock_proj(x_res))
+            shock_gate = shock_gate / shock_gate.mean(dim=1, keepdim=True).clamp_min(1e-8)
+            assign_input = assign_input + self.assign_shock(shock_gate * x_res)
+
+        assign = F.gelu(self.assign_norm(assign_input))
         weights = F.softmax(self.slice_proj(assign), dim=-1)
 
         weight_sum = weights.sum(dim=1, keepdim=True).transpose(1, 2).clamp_min(1e-8)
@@ -300,7 +325,7 @@ class GraphFlowBlock(nn.Module):
         Initialize one graph attention block.
 
         Args:
-            graph_mode (str): Graph injection mode, either bias or assign.
+            graph_mode (str): Graph injection mode.
             width (int): Node token width.
             num_slices (int): Number of slice tokens.
             num_heads (int): Number of attention heads.
@@ -309,18 +334,24 @@ class GraphFlowBlock(nn.Module):
             graph_bias_eps (float): Small graph bias stabilizer.
         """
         super().__init__()
-        if graph_mode == "bias":
+        if graph_mode in {"bias", "shock_bias"}:
             self.graph_attn = GraphBiasAttention(
                 width=width,
                 num_slices=num_slices,
                 num_heads=num_heads,
                 graph_beta_init=graph_beta_init,
                 graph_bias_eps=graph_bias_eps,
+                shock=graph_mode == "shock_bias",
             )
-        elif graph_mode == "assign":
-            self.graph_attn = GraphAssignAttention(width=width, num_slices=num_slices, num_heads=num_heads)
+        elif graph_mode in {"assign", "shock_assign"}:
+            self.graph_attn = GraphAssignAttention(
+                width=width,
+                num_slices=num_slices,
+                num_heads=num_heads,
+                shock=graph_mode == "shock_assign",
+            )
         else:
-            raise ValueError("graph_mode must be either 'bias' or 'assign'")
+            raise ValueError("graph_mode must be bias, assign, shock_bias, or shock_assign")
 
         self.norm1 = nn.LayerNorm(width)
         self.norm2 = nn.LayerNorm(width)
@@ -387,7 +418,7 @@ class HyperFlowNet(nn.Module):
             adj_indices (Tensor): Sparse adjacency indices. (2, E).
             adj_values (Tensor): Sparse adjacency values. (E,).
             edge_index (Tensor): Undirected local edge list. (2, E_EDGE).
-            graph_mode (str): Graph injection mode, either bias or assign.
+            graph_mode (str): Graph injection mode.
             width (int): Hidden channel width.
             depth (int): Number of HyperFlowNet blocks.
             num_slices (int): Number of slice tokens.
@@ -457,7 +488,7 @@ class HyperFlowNet(nn.Module):
             x = block(x, self.adj_indices, self.adj_values)
         return self.proj(x)
 
-    def predict(self, inputs: Tensor, coords: Tensor, steps: int) -> Tensor:
+    def predict(self, inputs: Tensor, coords: Tensor, steps: int, bc: Optional[object] = None) -> Tensor:
         """
         Autoregressively predict a full trajectory from one initial state.
 
@@ -465,6 +496,7 @@ class HyperFlowNet(nn.Module):
             inputs (Tensor): Initial state. (B, N, C_IN).
             coords (Tensor): Node coordinates. (B, N, D).
             steps (int): Number of future frames to predict.
+            bc (Optional[object]): Boundary condition with an enforce method.
 
         Returns:
             Tensor: Predicted sequence including the initial state. (B, steps + 1, N, C_OUT).
@@ -473,7 +505,11 @@ class HyperFlowNet(nn.Module):
         state = inputs
         with torch.no_grad():
             for step_idx in tqdm(range(steps), desc="Predicting", leave=False, dynamic_ncols=True):
-                t_norm = torch.full((inputs.shape[0],), step_idx / max(steps, 1), device=inputs.device, dtype=inputs.dtype)
+                t_norm = torch.full(
+                    (inputs.shape[0],), step_idx / max(steps, 1), device=inputs.device, dtype=inputs.dtype
+                )
                 state = self.forward(state, coords, t_norm=t_norm)
+                if bc is not None:
+                    state = bc.enforce(state)
                 states.append(state)
         return torch.stack(states, dim=1)

@@ -4,13 +4,13 @@
 
 - HyperFlowNet is `HyperFlowNet: A Spatio-Temporal Neural Operator for Shock-Wave Flow Simulation`.
 - It is the transient CFD task repository in the WSNet family.
-- The current default workflow is autoregressive shock-wave flow prediction on unstructured mesh.
+- The current default workflow is autoregressive shock-wave flow prediction on a fixed irregular mesh.
 - Keep this repository focused on task-facing code: data ingestion, rollout training, inference, visualization, metrics, and fast local model iteration.
 - Treat the current repository code as the source of truth when older notes, slides, reports, or README text disagree with it.
 
 ## Active Code Path
 
-- The active workflow is `main.py -> FlowData -> HyperFlowTrainer -> HyperFlowNet -> Metrics / FlowVis`.
+- The active workflow is `main.py -> FlowData -> BoundaryCondition -> HyperFlowTrainer -> HyperFlowNet -> Metrics / FlowVis / FlowTwin`.
 - `config.py` is the canonical source for default command-line options and experiment knobs.
 - Keep agent notes limited to modules and mechanisms that exist in the current repository code.
 
@@ -20,7 +20,7 @@
 - Cached cases are PyTorch dictionaries with `states` and `coords`.
 - The default workflow uses 2D states with channel order `[Vx, Vy, P, T]` and coordinates shaped `(N, 2)`.
 - Raw 2D Fluent-style rows are parsed as `[Index, x, y, P, Vx, Vy, T]` and cached as `[Vx, Vy, P, T]`.
-- `FlowData` has a 3D parsing branch, but the current default `main.py` workflow and `initial_state_from_label()` are 2D / four-channel oriented. Do not describe 3D as a validated full workflow unless the code is updated.
+- `FlowData` has a 3D parsing branch, but `initial_state_from_label()` is currently 2D / four-channel oriented. Do not describe 3D as a validated full workflow unless the code is updated.
 - Case labels are parsed from the numeric suffix in names such as `case_4500`.
 - Train and validation cases are augmented with sliding temporal windows. Test cases keep full sequences for rollout evaluation.
 - The default split behavior is deterministic under seed 42, with `split_counts=(2, 1)` for validation and test case counts.
@@ -28,18 +28,24 @@
 ## Preprocessing And Runtime Flow
 
 - `data_pipeline()` fits `StandardScalerTensor` on training states and `MinMaxScalerTensor(norm_range="bipolar")` on training coordinates.
+- `BoundaryCondition` is fitted from raw training sequences after state scaling statistics are available.
+- Checkpoints store `bc` under `params["bc"]`; do not store it in `scaler_state_dict`.
 - Training and validation batches contain standardized `seq`, normalized `coords`, `t0_norm`, and `dt_norm`. Labels are not passed into the trainer.
 - Probe and train build one local graph from the first normalized training coordinate set.
-- Inference loads `ckpt.pt`, restores saved scalers and model parameters, builds one local graph from the first test coordinate set, constructs the initial physical state with `initial_state_from_label()`, then calls `model.predict()`.
-- Inference writes `<label>_pred.pt`, `metrics.json`, and MP4 visualizations through `FlowVis`.
+- Inference loads `ckpt.pt`, restores saved scalers and model parameters, restores `bc` from `params`, builds one local graph from the first test coordinate set, constructs the initial physical state with `initial_state_from_label()`, then calls `model.predict(..., bc=bc)`.
+- Inference writes `<label>_pred.pt`, `metrics.json`, and MP4 visualizations through `FlowVis` and `FlowTwin`.
 - The current graph is a fixed reference graph per run. Do not claim moving-mesh, variable-cardinality, or per-case graph rebuilding support unless the implementation changes.
 
 ## Model And Trainer Contract
 
 - `build_local_graph()` constructs a kNN sparse local operator and an undirected edge list from normalized coordinates.
-- `HyperFlowNet` is the local spatio-temporal neural operator implementation. It predicts one next state from `(inputs, coords, t_norm)` and returns `(pred_state, weight_bank)`.
-- The model combines current node states, learnable Fourier coordinate encoding, sinusoidal time encoding, frontier-aware slice attention, and residual feed-forward blocks.
-- `HyperFlowTrainer` uses AdamW, cosine annealing, channel-weighted NMSE, autoregressive rollout loss, rollout noise injection during training, and frontier regularization from early slice assignments.
+- `HyperFlowNet` predicts one next state from `(inputs, coords, t_norm)` and returns only `pred_state`.
+- Valid graph modes are `bias`, `assign`, `shock_bias`, and `shock_assign`.
+- `bias` and `shock_bias` inject graph structure into slice-token attention logits.
+- `assign` and `shock_assign` inject graph structure into node-to-slice assignment.
+- Shock-aware modes use the local residual `x - A x` to highlight high-contrast flow features.
+- `bc` is a rollout projection applied after each model prediction and before both loss evaluation and autoregressive state update.
+- `HyperFlowTrainer` uses AdamW, cosine annealing, channel-weighted NMSE, autoregressive rollout loss, and rollout noise injection during training.
 - Rollout curriculum advances by `rollout_patience` and `max_rollout_steps`, not by validation-loss triggers.
 - Validation loss is computed through the same rollout loss path with model evaluation mode and no injected noise.
 
@@ -54,13 +60,14 @@
 ## Practical Change Strategy
 
 - Keep code and documents aligned with the active implementation.
+- Use `/Users/wsn/pyenv/bin/python` for local Python checks.
 - When changing the data pipeline, preserve the semantic contract:
   - raw or cached default states end up in `[Vx, Vy, P, T]`
   - feature scaling is channel-wise standardization
   - coordinate scaling is min-max normalization to `[-1, 1]`
   - train / validation use sliding windows
   - test data keeps full sequences for long-rollout evaluation
-- When changing the trainer, protect the rollout + noise-injection path first.
+- When changing the trainer, protect the rollout + noise-injection + bc projection path first.
 - When changing the model, keep the reference-graph assumption explicit unless graph rebuilding is implemented end to end.
 - Avoid adding moving-mesh or variable-cardinality machinery before the project truly needs it.
-- Do not split the trainer into many thin near-empty subclasses when one subclass plus the existing hooks is enough.
+- `FlowTwin` is an axisymmetric 2D-to-3D `Vy` renderer, not a general 3D CFD solver.

@@ -72,6 +72,7 @@ class HyperFlowTrainer(BaseTrainer):
         noise_std_init: float = 0.01,
         noise_decay: float = 0.7,
         channel_weights: Optional[list[float]] = None,
+        bc: Optional[object] = None,
         **kwargs,
     ) -> None:
         """
@@ -88,6 +89,7 @@ class HyperFlowTrainer(BaseTrainer):
             noise_std_init (float): Initial rollout noise standard deviation.
             noise_decay (float): Multiplicative rollout noise decay.
             channel_weights (Optional[list[float]]): Optional channel weights. (C,).
+            bc (Optional[object]): Boundary condition with an enforce method.
             **kwargs: Arguments forwarded to BaseTrainer.
         """
         optimizer = kwargs.pop("optimizer", None)
@@ -120,6 +122,7 @@ class HyperFlowTrainer(BaseTrainer):
         self.current_noise_std = noise_std_init
         self.rollout_counter = 0
         self.log_update_info = False
+        self.bc = bc
 
     def _update_curriculum(self) -> None:
         """
@@ -171,6 +174,8 @@ class HyperFlowTrainer(BaseTrainer):
 
             step_t_norm = t0_norm + step_idx * dt_norm
             pred_state = self.model(step_input, coords, t_norm=step_t_norm)
+            if self.bc is not None:
+                pred_state = self.bc.enforce(pred_state)
             target_state = seq[:, step_idx + 1]
 
             step_weight = 2.0 * (step_idx + 1) / total_weight

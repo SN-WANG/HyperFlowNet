@@ -8,7 +8,7 @@ Project identity:
 
 The current active code path is:
 
-- `main.py -> FlowData -> HyperFlowTrainer -> HyperFlowNet -> Metrics / FlowVis`
+- `main.py -> FlowData -> BoundaryCondition -> HyperFlowTrainer -> HyperFlowNet -> Metrics / FlowVis / FlowTwin`
 
 The most important structural rule is:
 

@@ -12,6 +12,7 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 import config
+from data.boundary import BoundaryCondition
 from data.flow_data import FlowData
 from data.flow_metrics import Metrics
 from data.flow_vis import FlowVis
@@ -105,6 +106,7 @@ def build_trainer(
         noise_std_init=args.noise_std_init,
         noise_decay=args.noise_decay,
         channel_weights=args.channel_weights,
+        bc=getattr(args, "bc", None),
     )
 
 
@@ -131,6 +133,14 @@ def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
     train_coords = torch.cat(train_data.coords, dim=0)
     args.state_scaler = StandardScalerTensor().fit(train_states, channel_dim=-1)
     args.coord_scaler = MinMaxScalerTensor(norm_range="bipolar").fit(train_coords, channel_dim=-1)
+    args.bc = None
+    if args.use_bc:
+        args.bc = BoundaryCondition().fit(
+            train_data,
+            args.state_scaler,
+            velocity_channels=list(range(args.spatial_dim)),
+            velocity_threshold=args.bc_threshold,
+        )
 
     train_dataset = [
         (
@@ -205,6 +215,7 @@ def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
         "model_args": model_args,
         "graph_k": args.graph_k,
         "graph_sigma_scale": args.graph_sigma_scale,
+        "bc": args.bc.state_dict() if args.bc is not None else None,
     }
     scalers = {
         "state_scaler": args.state_scaler,
@@ -369,6 +380,7 @@ def train_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
         "model_args": model_args,
         "graph_k": args.graph_k,
         "graph_sigma_scale": args.graph_sigma_scale,
+        "bc": args.bc.state_dict() if args.bc is not None else None,
     }
     scalers = {
         "state_scaler": args.state_scaler,
@@ -399,6 +411,10 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
     checkpoint = torch.load(output_dir / "ckpt.pt", map_location=device, weights_only=True)
     params = checkpoint["params"]
     scaler_state = checkpoint["scaler_state_dict"]
+    bc = None
+    if params.get("bc") is not None:
+        bc = BoundaryCondition()
+        bc.load_state_dict(params["bc"])
 
     state_scaler = StandardScalerTensor()
     state_scaler.load_state_dict(scaler_state["state_scaler"])
@@ -445,6 +461,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
             inputs=init_state_std,
             coords=coords_norm,
             steps=gt_seq.shape[0] - 1,
+            bc=bc,
         )
         pred_seq = state_scaler.inverse_transform(pred_std).squeeze(0).cpu()
         case_metrics = metrics.compute(pred_seq, gt_seq)

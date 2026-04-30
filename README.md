@@ -1,35 +1,33 @@
-# HyperFlowNet: A Spatio-Temporal Neural Operator for Shock-Wave Flow Simulation
+# HyperFlowNet
 
 [![Role](https://img.shields.io/badge/Role-Research%20Code-0f766e)](https://github.com/SN-WANG/HyperFlowNet)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-**HyperFlowNet** is the transient CFD repository
-in the WSNet family. It inherits the same lightweight training, normalization, and utility foundations from
-[WSNet](https://github.com/SN-WANG/WSNet), while focusing on autoregressive shock-wave flow prediction on unstructured mesh.
+**HyperFlowNet** is the transient CFD repository in the WSNet family. It keeps the shock-wave rollout workflow local to this repository while reusing the lightweight training, normalization, and utility style of [WSNet](https://github.com/SN-WANG/WSNet).
 
 ## 📌 Overview
 
 HyperFlowNet keeps the full workflow for this task in one place:
-dataset handling, memory probing, model training, case-wise inference, MP4 visualization, and metric export.
+dataset handling, memory probing, model training, case-wise inference, visualization, and metric export.
 
 The current scope includes:
 
 - fixed-mesh shock-wave flow simulation
 - autoregressive rollout learning on Fluent-style CFD sequences
-- channel-wise state standardization and coordinate normalization
-- end-to-end probe, train, and infer workflows
-- case-wise visualization and diagnostic metrics
+- graph-injected slice attention for irregular mesh nodes
+- hard no-slip wall boundary condition enforcement
+- case-wise comparison, focused-region, and digital-twin visualization
 
 ## ✨ Highlights
 
 - `HyperFlowNet` as a spatio-temporal neural operator for shock-wave rollout prediction
-- Unified `main.py` workflow for `probe`, `train`, and `infer`
-- Fluent-style raw-text ingestion with cached `.pt` case support
-- Standardized flow states and min-max normalized coordinates
-- Local graph construction from the reference mesh
-- Rollout-based NMSE training with checkpointing and metric export
-- Case-wise MP4 visualization for ground truth, prediction, and relative error
+- Four graph modes through `--graph_mode`: `bias`, `assign`, `shock_bias`, and `shock_assign`
+- Shock-aware graph injection based on local graph residuals
+- Hard boundary condition projection through `bc` during training and inference rollout
+- Weighted autoregressive NMSE training with rollout curriculum and noise decay
+- Deterministic first-frame reconstruction from `case_<label>` and mesh coordinates
+- `FlowTwin` axisymmetric `Vy` rendering for 2D-to-3D digital-twin videos
 
 ## 🧱 Repository Layout
 
@@ -40,8 +38,10 @@ HyperFlowNet/
 ├── models/
 │   └── hflownet.py
 ├── data/
+│   ├── boundary.py
 │   ├── flow_data.py
 │   ├── flow_metrics.py
+│   ├── flow_twin.py
 │   ├── flow_vis.py
 │   └── initial_state.py
 ├── training/
@@ -83,6 +83,12 @@ python main.py --mode probe --data_dir ./dataset --output_dir ./runs
 
 ```bash
 python main.py --mode train --data_dir ./dataset --output_dir ./runs
+```
+
+### Run a graph-mode ablation
+
+```bash
+python main.py --mode train --graph_mode shock_bias --data_dir ./dataset --output_dir ./runs_shock_bias
 ```
 
 ### Run inference and generate visualizations
@@ -134,11 +140,26 @@ Each raw text file is expected to follow the 2D convention used by `FlowData`:
 - source columns: `[Index, x, y, P, Vx, Vy, T]`
 - cached state order: `[Vx, Vy, P, T]`
 
+## 🧾 Workflow Outputs
+
+```text
+runs/
+├── ckpt.pt
+├── best.pt
+├── history.json
+├── metrics.json
+├── <label>_pred.pt
+├── <label>_full.mp4
+├── <label>_focus_vy.mp4
+└── <label>_twin_vy.mp4
+```
+
+Checkpoints store model arguments, graph settings, and `bc` state in `params`, while state and coordinate scalers are stored separately in `scaler_state_dict`.
+
 ## 🔗 Relationship to WSNet
 
 HyperFlowNet is built on top of [WSNet](https://github.com/SN-WANG/WSNet).
-WSNet keeps the reusable core modules, while HyperFlowNet keeps the CFD dataset pipeline, task-specific model entry point,
-and experiment workflow.
+WSNet keeps the reusable core modules, while HyperFlowNet keeps the CFD dataset pipeline, task-specific model entry point, and experiment workflow.
 
 ## 📚 Citation
 

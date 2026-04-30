@@ -66,7 +66,11 @@ def get_args() -> argparse.Namespace:
 
     hflownet = parser.add_argument_group("HyperFlowNet")
     hflownet.add_argument(
-        "--graph_mode", type=str, default="bias", choices=["bias", "assign"], help="Graph injection mode."
+        "--graph_mode",
+        type=str,
+        default="shock_bias",
+        choices=["bias", "assign", "shock_bias", "shock_assign"],
+        help="Graph injection mode.",
     )
     hflownet.add_argument(
         "--depth", type=int, default=4, help="Number of stacked HyperFlowNet blocks."
@@ -109,7 +113,25 @@ def get_args() -> argparse.Namespace:
     )
 
     # ============================================================
-    # 5. Trainer
+    # 5. Boundary Condition
+    # ============================================================
+
+    boundary = parser.add_argument_group("Boundary Condition")
+    boundary.add_argument(
+        "--use_bc",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use hard wall boundary condition.",
+    )
+    boundary.add_argument(
+        "--bc_threshold",
+        type=float,
+        default=1e-4,
+        help="Velocity threshold for wall-node detection.",
+    )
+
+    # ============================================================
+    # 6. Trainer
     # ============================================================
 
     trainer = parser.add_argument_group("Trainer")
@@ -130,7 +152,7 @@ def get_args() -> argparse.Namespace:
     )
 
     # ============================================================
-    # 6. Curriculum
+    # 7. Curriculum
     # ============================================================
 
     curriculum = parser.add_argument_group("Curriculum")
