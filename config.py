@@ -1,4 +1,4 @@
-# Argument configuration for HyperFlowNet shock-wave flow simulation
+# Argument configuration for HyperFlowNet flow simulation
 # Author: Shengning Wang
 
 import argparse
@@ -8,13 +8,13 @@ import torch
 
 def get_args() -> argparse.Namespace:
     """
-    Parse command-line arguments for HyperFlowNet shock-wave flow simulation.
+    Parse command-line arguments for HyperFlowNet flow simulation.
 
     Returns:
         argparse.Namespace: Parsed experiment arguments.
     """
     parser = argparse.ArgumentParser(
-        description="HyperFlowNet: A Spatio-Temporal Neural Operator for Shock-Wave Flow Simulation",
+        description="HyperFlowNet: A Spatio-Temporal Neural Operator for Flow Simulation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -66,11 +66,7 @@ def get_args() -> argparse.Namespace:
 
     hflownet = parser.add_argument_group("HyperFlowNet")
     hflownet.add_argument(
-        "--graph_mode",
-        type=str,
-        default="shock_bias",
-        choices=["bias", "assign", "shock_bias", "shock_assign"],
-        help="Graph injection mode.",
+        "--graph_mode", type=str, default="bias", choices=["bias", "assign"], help="Graph injection mode.",
     )
     hflownet.add_argument(
         "--depth", type=int, default=4, help="Number of stacked HyperFlowNet blocks."

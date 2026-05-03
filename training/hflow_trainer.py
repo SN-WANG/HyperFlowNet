@@ -1,4 +1,4 @@
-# HyperFlowNet rollout trainer for shock-wave flow simulation
+# HyperFlowNet rollout trainer for flow simulation
 # Author: Shengning Wang
 
 from typing import Any, Optional
@@ -57,7 +57,7 @@ class NMSECriterion(nn.Module):
 
 class HyperFlowTrainer(BaseTrainer):
     """
-    Rollout trainer for HyperFlowNet shock-wave flow prediction.
+    Rollout trainer for HyperFlowNet flow prediction.
     """
 
     def __init__(

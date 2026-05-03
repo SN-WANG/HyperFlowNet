@@ -4,7 +4,7 @@ Read `.codex/AGENTS.md` before making substantial changes in this repository. Th
 
 Project identity:
 
-- `HyperFlowNet: A Spatio-Temporal Neural Operator for Shock-Wave Flow Simulation`
+- `HyperFlowNet: A Spatio-Temporal Neural Operator for Flow Simulation`
 
 The current active code path is:
 

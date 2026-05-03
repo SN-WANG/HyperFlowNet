@@ -1,4 +1,4 @@
-# Boundary condition utilities for shock-wave rollout prediction
+# Boundary condition utilities for rollout prediction
 # Author: Shengning Wang
 
 from typing import Any, Dict, List

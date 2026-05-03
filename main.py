@@ -1,4 +1,4 @@
-# Main script for HyperFlowNet shock-wave flow simulation workflows
+# Main script for HyperFlowNet flow simulation workflows
 # Author: Shengning Wang
 
 import json
@@ -33,7 +33,7 @@ def build_model(
     edge_index: Tensor | None = None,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
-    Build HyperFlowNet for shock-wave flow simulation and return its constructor arguments.
+    Build HyperFlowNet for flow simulation and return its constructor arguments.
 
     Args:
         args (Any | None): Parsed arguments.
@@ -83,7 +83,7 @@ def build_trainer(
 
     Args:
         args (Any): Parsed arguments.
-        model (HyperFlowNet): HyperFlowNet model for shock-wave flow simulation.
+        model (HyperFlowNet): HyperFlowNet model for flow simulation.
         params (Dict[str, Any]): Checkpoint parameters.
         scalers (Dict[str, object]): Fitted scalers.
         output_dir (Path): Artifact directory.

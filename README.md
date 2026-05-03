@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-**HyperFlowNet** is the transient CFD repository in the WSNet family. It keeps the shock-wave rollout workflow local to this repository while reusing the lightweight training, normalization, and utility style of [WSNet](https://github.com/SN-WANG/WSNet).
+**HyperFlowNet** is the transient CFD repository in the WSNet family. It keeps the flow rollout workflow local to this repository while reusing the lightweight training, normalization, and utility style of [WSNet](https://github.com/SN-WANG/WSNet).
 
 ## 📌 Overview
 
@@ -13,7 +13,7 @@ dataset handling, memory probing, model training, case-wise inference, visualiza
 
 The current scope includes:
 
-- fixed-mesh shock-wave flow simulation
+- fixed-mesh flow simulation
 - autoregressive rollout learning on Fluent-style CFD sequences
 - graph-injected slice attention for irregular mesh nodes
 - hard no-slip wall boundary condition enforcement
@@ -21,9 +21,8 @@ The current scope includes:
 
 ## ✨ Highlights
 
-- `HyperFlowNet` as a spatio-temporal neural operator for shock-wave rollout prediction
-- Four graph modes through `--graph_mode`: `bias`, `assign`, `shock_bias`, and `shock_assign`
-- Shock-aware graph injection based on local graph residuals
+- `HyperFlowNet` as a spatio-temporal neural operator for flow rollout prediction
+- Two graph modes through `--graph_mode`: `bias` and `assign`
 - Hard boundary condition projection through `bc` during training and inference rollout
 - Weighted autoregressive NMSE training with rollout curriculum and noise decay
 - Deterministic first-frame reconstruction from `case_<label>` and mesh coordinates
@@ -88,7 +87,7 @@ python main.py --mode train --data_dir ./dataset --output_dir ./runs
 ### Run a graph-mode ablation
 
 ```bash
-python main.py --mode train --graph_mode shock_bias --data_dir ./dataset --output_dir ./runs_shock_bias
+python main.py --mode train --graph_mode assign --data_dir ./dataset --output_dir ./runs_assign
 ```
 
 ### Run inference and generate visualizations

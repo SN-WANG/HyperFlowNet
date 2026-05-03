@@ -2,9 +2,9 @@
 
 ## Project Snapshot
 
-- HyperFlowNet is `HyperFlowNet: A Spatio-Temporal Neural Operator for Shock-Wave Flow Simulation`.
+- HyperFlowNet is `HyperFlowNet: A Spatio-Temporal Neural Operator for Flow Simulation`.
 - It is the transient CFD task repository in the WSNet family.
-- The current default workflow is autoregressive shock-wave flow prediction on a fixed irregular mesh.
+- The current default workflow is autoregressive flow prediction on a fixed irregular mesh.
 - Keep this repository focused on task-facing code: data ingestion, rollout training, inference, visualization, metrics, and fast local model iteration.
 - Treat the current repository code as the source of truth when older notes, slides, reports, or README text disagree with it.
 
@@ -40,10 +40,9 @@
 
 - `build_local_graph()` constructs a kNN sparse local operator and an undirected edge list from normalized coordinates.
 - `HyperFlowNet` predicts one next state from `(inputs, coords, t_norm)` and returns only `pred_state`.
-- Valid graph modes are `bias`, `assign`, `shock_bias`, and `shock_assign`.
-- `bias` and `shock_bias` inject graph structure into slice-token attention logits.
-- `assign` and `shock_assign` inject graph structure into node-to-slice assignment.
-- Shock-aware modes use the local residual `x - A x` to highlight high-contrast flow features.
+- Valid graph modes are `bias` and `assign`.
+- `bias` injects graph structure into slice-token attention logits.
+- `assign` injects graph structure into node-to-slice assignment.
 - `bc` is a rollout projection applied after each model prediction and before both loss evaluation and autoregressive state update.
 - `HyperFlowTrainer` uses AdamW, cosine annealing, channel-weighted NMSE, autoregressive rollout loss, and rollout noise injection during training.
 - Rollout curriculum advances by `rollout_patience` and `max_rollout_steps`, not by validation-loss triggers.
