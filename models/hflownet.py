@@ -434,14 +434,10 @@ class HyperFlowNet(nn.Module):
             for _ in range(depth)
         ])
         self.proj = nn.Linear(width, out_channels)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
-        if in_channels != out_channels:
-            raise ValueError("residual prediction requires in_channels == out_channels")
 
     def forward(self, inputs: Tensor, coords: Tensor, t_norm: Optional[Tensor] = None) -> Tensor:
         """
-        Predict the next state on the mesh as a residual update.
+        Predict the next state on the mesh.
 
         Args:
             inputs (Tensor): Current node features. (B, N, C_IN).
@@ -466,7 +462,7 @@ class HyperFlowNet(nn.Module):
         x = self.embed(x)
         for block in self.blocks:
             x = block(x, self.adj_indices, self.adj_values)
-        return inputs + self.proj(x)
+        return self.proj(x)
 
     def predict(self, inputs: Tensor, coords: Tensor, steps: int, bc: Optional[object] = None) -> Tensor:
         """
