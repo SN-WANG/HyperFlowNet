@@ -6,6 +6,24 @@ import argparse
 import torch
 
 
+def _expand_spatial_list(values: list[int], spatial_dim: int) -> list[int]:
+    """
+    Expand a one-value spatial option to all coordinate dimensions.
+
+    Args:
+        values (list[int]): Parsed spatial option.
+        spatial_dim (int): Spatial coordinate dimension.
+
+    Returns:
+        list[int]: Spatial option with one value per coordinate dimension.
+    """
+    if len(values) == spatial_dim:
+        return values
+    if len(values) == 1:
+        return values * spatial_dim
+    return values[:spatial_dim]
+
+
 def get_args() -> argparse.Namespace:
     """
     Parse command-line arguments for HyperFlowNet flow simulation.
@@ -38,6 +56,13 @@ def get_args() -> argparse.Namespace:
     general.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Computation device."
     )
+    general.add_argument(
+        "--model_name",
+        type=str,
+        default="hflownet",
+        choices=["hflownet", "transolver", "geofno", "gcn", "meshgraphnet", "gnot", "gino"],
+        help="Model architecture to train and evaluate.",
+    )
 
     # ============================================================
     # 2. Data
@@ -61,55 +86,70 @@ def get_args() -> argparse.Namespace:
     )
 
     # ============================================================
-    # 3. HyperFlowNet
+    # 3. Model
     # ============================================================
 
-    hflownet = parser.add_argument_group("HyperFlowNet")
-    hflownet.add_argument(
+    model = parser.add_argument_group("Model")
+    model.add_argument(
         "--graph_mode", type=str, default="bias", choices=["bias", "assign"], help="Graph injection mode.",
     )
-    hflownet.add_argument(
+    model.add_argument(
         "--depth", type=int, default=4, help="Number of stacked HyperFlowNet blocks."
     )
-    hflownet.add_argument(
+    model.add_argument(
         "--width", type=int, default=128, help="Hidden channel width."
     )
-    hflownet.add_argument(
+    model.add_argument(
         "--num_slices", type=int, default=32, help="Number of slice tokens."
     )
-    hflownet.add_argument(
+    model.add_argument(
         "--num_heads", type=int, default=8, help="Number of slice-space attention heads."
     )
-    hflownet.add_argument(
+    model.add_argument(
         "--coord_features", type=int, default=8, help="Half-dimension of Fourier spatial encoding."
     )
-    hflownet.add_argument(
+    model.add_argument(
         "--time_features", type=int, default=4, help="Half-dimension of temporal encoding."
     )
-    hflownet.add_argument(
+    model.add_argument(
         "--freq_base", type=int, default=1000, help="Base for temporal frequency decay."
     )
-
-    # ============================================================
-    # 4. Graph
-    # ============================================================
-
-    graph = parser.add_argument_group("Graph")
-    graph.add_argument(
+    model.add_argument(
+        "--dropout", type=float, default=0.0, help="Dropout rate for baseline models."
+    )
+    model.add_argument(
+        "--num_experts", type=int, default=4, help="Number of geometric experts for GNOT."
+    )
+    model.add_argument(
         "--graph_k", type=int, default=12, help="Number of nearest neighbors in the local graph."
     )
-    graph.add_argument(
+    model.add_argument(
         "--graph_sigma_scale", type=float, default=1.5, help="Distance scale multiplier of graph weights."
     )
-    graph.add_argument(
+    model.add_argument(
         "--graph_beta_init", type=float, default=0.13, help="Initial graph bias strength."
     )
-    graph.add_argument(
+    model.add_argument(
         "--graph_bias_eps", type=float, default=1e-6, help="Small graph bias stabilizer."
+    )
+    model.add_argument(
+        "--geofno_modes", type=int, nargs="+", default=[12], help="Geo-FNO Fourier modes per spatial dimension."
+    )
+    model.add_argument(
+        "--geofno_grid_size", type=int, nargs="+", default=[64], help="Geo-FNO latent grid size per spatial dimension."
+    )
+    model.add_argument(
+        "--gino_modes", type=int, nargs="+", default=[12], help="GINO Fourier modes per spatial dimension."
+    )
+    model.add_argument(
+        "--gino_grid_size", type=int, nargs="+", default=[64], help="GINO latent grid size per spatial dimension."
+    )
+    model.add_argument(
+        "--gino_neighbors", type=int, default=16, help="Number of local integral neighbors for GINO."
     )
 
     # ============================================================
-    # 5. Boundary Condition
+    # 4. Boundary Condition
     # ============================================================
 
     boundary = parser.add_argument_group("Boundary Condition")
@@ -127,7 +167,7 @@ def get_args() -> argparse.Namespace:
     )
 
     # ============================================================
-    # 6. Trainer
+    # 5. Trainer
     # ============================================================
 
     trainer = parser.add_argument_group("Trainer")
@@ -148,7 +188,7 @@ def get_args() -> argparse.Namespace:
     )
 
     # ============================================================
-    # 7. Curriculum
+    # 6. Curriculum
     # ============================================================
 
     curriculum = parser.add_argument_group("Curriculum")
@@ -165,4 +205,9 @@ def get_args() -> argparse.Namespace:
         "--noise_decay", type=float, default=0.7, help="Multiplicative decay of rollout noise."
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.geofno_modes = _expand_spatial_list(args.geofno_modes, args.spatial_dim)
+    args.geofno_grid_size = _expand_spatial_list(args.geofno_grid_size, args.spatial_dim)
+    args.gino_modes = _expand_spatial_list(args.gino_modes, args.spatial_dim)
+    args.gino_grid_size = _expand_spatial_list(args.gino_grid_size, args.spatial_dim)
+    return args

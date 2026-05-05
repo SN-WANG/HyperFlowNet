@@ -18,7 +18,13 @@ from data.flow_metrics import Metrics
 from data.flow_vis import FlowVis
 from data.flow_twin import FlowTwin
 from data.initial_state import initial_state_from_label
+from models.gcn import GCN
+from models.geofno import GeoFNO
+from models.gino import GINO
+from models.gnot import GNOT
 from models.hflownet import HyperFlowNet, build_local_graph
+from models.meshgraphnet import MeshGraphNet
+from models.transolver import Transolver
 from training.hflow_trainer import HyperFlowTrainer
 from utils.hue_logger import hue, logger
 from utils.scaler import MinMaxScalerTensor, StandardScalerTensor
@@ -33,7 +39,7 @@ def build_model(
     edge_index: Tensor | None = None,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
-    Build HyperFlowNet for flow simulation and return its constructor arguments.
+    Build the configured flow model and return its constructor arguments.
 
     Args:
         args (Any | None): Parsed arguments.
@@ -47,12 +53,14 @@ def build_model(
     """
     if model_args is None:
         model_args = {
+            "model_name": args.model_name,
             "in_channels": len(args.channel_names),
             "out_channels": len(args.channel_names),
             "spatial_dim": args.spatial_dim,
-            "graph_mode": args.graph_mode,
             "width": args.width,
             "depth": args.depth,
+            "dropout": args.dropout,
+            "graph_mode": args.graph_mode,
             "num_slices": args.num_slices,
             "num_heads": args.num_heads,
             "coord_features": args.coord_features,
@@ -60,30 +68,115 @@ def build_model(
             "freq_base": args.freq_base,
             "graph_beta_init": args.graph_beta_init,
             "graph_bias_eps": args.graph_bias_eps,
+            "num_experts": args.num_experts,
+            "geofno_modes": args.geofno_modes,
+            "geofno_grid_size": args.geofno_grid_size,
+            "gino_modes": args.gino_modes,
+            "gino_grid_size": args.gino_grid_size,
+            "gino_neighbors": args.gino_neighbors,
         }
 
-    model = HyperFlowNet(
-        adj_indices=adj_indices,
-        adj_values=adj_values,
-        edge_index=edge_index,
-        **model_args,
-    )
+    model_name = model_args["model_name"].lower()
+    if model_name == "hflownet":
+        model = HyperFlowNet(
+            in_channels=model_args["in_channels"],
+            out_channels=model_args["out_channels"],
+            spatial_dim=model_args["spatial_dim"],
+            adj_indices=adj_indices,
+            adj_values=adj_values,
+            edge_index=edge_index,
+            graph_mode=model_args["graph_mode"],
+            width=model_args["width"],
+            depth=model_args["depth"],
+            num_slices=model_args["num_slices"],
+            num_heads=model_args["num_heads"],
+            coord_features=model_args["coord_features"],
+            time_features=model_args["time_features"],
+            freq_base=model_args["freq_base"],
+            graph_beta_init=model_args["graph_beta_init"],
+            graph_bias_eps=model_args["graph_bias_eps"],
+        )
+    elif model_name == "transolver":
+        model = Transolver(
+            in_channels=model_args["in_channels"],
+            out_channels=model_args["out_channels"],
+            spatial_dim=model_args["spatial_dim"],
+            width=model_args["width"],
+            depth=model_args["depth"],
+            num_slices=model_args["num_slices"],
+            num_heads=model_args["num_heads"],
+            dropout=model_args["dropout"],
+        )
+    elif model_name == "gnot":
+        model = GNOT(
+            in_channels=model_args["in_channels"],
+            out_channels=model_args["out_channels"],
+            spatial_dim=model_args["spatial_dim"],
+            width=model_args["width"],
+            depth=model_args["depth"],
+            num_heads=model_args["num_heads"],
+            num_experts=model_args["num_experts"],
+            dropout=model_args["dropout"],
+        )
+    elif model_name == "geofno":
+        model = GeoFNO(
+            in_channels=model_args["in_channels"],
+            out_channels=model_args["out_channels"],
+            spatial_dim=model_args["spatial_dim"],
+            width=model_args["width"],
+            depth=model_args["depth"],
+            modes=model_args["geofno_modes"],
+            grid_size=model_args["geofno_grid_size"],
+        )
+    elif model_name == "gino":
+        model = GINO(
+            in_channels=model_args["in_channels"],
+            out_channels=model_args["out_channels"],
+            spatial_dim=model_args["spatial_dim"],
+            width=model_args["width"],
+            depth=model_args["depth"],
+            modes=model_args["gino_modes"],
+            grid_size=model_args["gino_grid_size"],
+            neighbors=model_args["gino_neighbors"],
+        )
+    elif model_name == "gcn":
+        model = GCN(
+            in_channels=model_args["in_channels"],
+            out_channels=model_args["out_channels"],
+            spatial_dim=model_args["spatial_dim"],
+            adj_indices=adj_indices,
+            adj_values=adj_values,
+            width=model_args["width"],
+            depth=model_args["depth"],
+            dropout=model_args["dropout"],
+        )
+    elif model_name == "meshgraphnet":
+        model = MeshGraphNet(
+            in_channels=model_args["in_channels"],
+            out_channels=model_args["out_channels"],
+            spatial_dim=model_args["spatial_dim"],
+            edge_index=edge_index,
+            width=model_args["width"],
+            depth=model_args["depth"],
+        )
+    else:
+        raise ValueError(f"unknown model_name: {model_name}")
     return model, model_args
 
 
 def build_trainer(
     args: Any,
-    model: HyperFlowNet,
+    model: nn.Module,
     params: Dict[str, Any],
     scalers: Dict[str, object],
     output_dir: Path,
 ) -> HyperFlowTrainer:
     """
-    Build the HyperFlowNet rollout trainer.
+    Build the rollout trainer.
 
     Args:
         args (Any): Parsed arguments.
-        model (HyperFlowNet): HyperFlowNet model for flow simulation.
+        model (nn.Module): Flow model.
         params (Dict[str, Any]): Checkpoint parameters.
         scalers (Dict[str, object]): Fitted scalers.
         output_dir (Path): Artifact directory.
@@ -210,6 +303,7 @@ def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
         adj_values=adj_values,
         edge_index=edge_index,
     )
+    model_name = model_args["model_name"]
     params = {
         "channel_names": args.channel_names,
         "model_args": model_args,
@@ -329,6 +423,7 @@ def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
 
     logger.info(
         f"{hue.y}probe config:{hue.q} "
+        f"model={hue.b}{model_name}{hue.q}, class={hue.b}{model.__class__.__name__}{hue.q}, "
         f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, "
         f"nodes={hue.m}{N}{hue.q}, channels={hue.m}{C}{hue.q}, "
         f"rollout={hue.m}{reachable_rollout}{hue.q}/{hue.m}{min(args.max_rollout_steps, T - 1)}{hue.q}, "
