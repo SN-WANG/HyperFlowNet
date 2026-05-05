@@ -51,7 +51,7 @@ def get_args() -> argparse.Namespace:
         "--spatial_dim", type=int, default=2, choices=[2, 3], help="Spatial dimensionality."
     )
     data.add_argument(
-        "--win_len", type=int, default=15, help="Temporal window length for sequence slicing."
+        "--win_len", type=int, default=12, help="Temporal window length for sequence slicing."
     )
     data.add_argument(
         "--win_stride", type=int, default=1, help="Stride for sliding-window augmentation."
@@ -138,7 +138,7 @@ def get_args() -> argparse.Namespace:
         "--weight_decay", type=float, default=1e-4, help="AdamW weight decay."
     )
     trainer.add_argument(
-        "--max_epochs", type=int, default=800, help="Maximum training epochs."
+        "--max_epochs", type=int, default=560, help="Maximum training epochs."
     )
     trainer.add_argument(
         "--eta_min", type=float, default=1e-6, help="Minimum learning rate for cosine annealing."
@@ -153,7 +153,7 @@ def get_args() -> argparse.Namespace:
 
     curriculum = parser.add_argument_group("Curriculum")
     curriculum.add_argument(
-        "--max_rollout_steps", type=int, default=14, help="Maximum autoregressive rollout steps."
+        "--max_rollout_steps", type=int, default=11, help="Maximum autoregressive rollout steps."
     )
     curriculum.add_argument(
         "--rollout_patience", type=int, default=55, help="Epochs between curriculum advances."
