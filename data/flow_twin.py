@@ -301,6 +301,37 @@ class FlowTwin:
         vy = data[:, :, self.ch_names.index("Vy")]
         return self._derivative(vy, idx, weights, 0) - self._derivative(vx, idx, weights, 1)
 
+    def _large_bulb_mask(self, coords: Tensor) -> np.ndarray:
+        """
+        Select the visible core of the larger bulb for vorticity color scaling.
+
+        Args:
+            coords (Tensor): Axisymmetric coordinates. (N, 2).
+
+        Returns:
+            np.ndarray: Boolean node mask. (N,).
+        """
+        pts = coords.detach().cpu().numpy().astype(np.float32)
+        x = pts[:, 0]
+        radius = np.maximum(pts[:, 1], 0.0)
+        r_max = float(radius.max())
+        center_x = float(np.mean(x[radius > 0.96 * r_max]))
+        return (np.abs(x - center_x) < 0.92 * r_max) & (radius > 0.04 * r_max)
+
+    def _vorticity_clim(self, data: np.ndarray, coords: Tensor) -> Tuple[float, float]:
+        """
+        Compute a clipped vorticity color range focused on the larger bulb.
+
+        Args:
+            data (np.ndarray): Vorticity sequence. (T, N).
+            coords (Tensor): Axisymmetric coordinates. (N, 2).
+
+        Returns:
+            Tuple[float, float]: Symmetric vorticity limits.
+        """
+        vmax = float(np.percentile(np.abs(data[:, self._large_bulb_mask(coords)]).ravel(), 95))
+        return -vmax, vmax
+
     def _render_field(
         self,
         pred: Tensor,
@@ -320,7 +351,7 @@ class FlowTwin:
         """
         if field_name.lower() in {"vorticity", "omega"}:
             field = self._vorticity(pred, coords)
-            return field, "Vorticity", "vorticity", self._signed_clim(field), _CMAP["velocity"]
+            return field, "Vorticity", "vorticity", self._vorticity_clim(field, coords), _CMAP["velocity"]
 
         channel_lookup = {name.lower(): idx for idx, name in enumerate(self.ch_names)}
         ch_idx = channel_lookup[field_name.lower()]
