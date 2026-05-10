@@ -26,7 +26,7 @@ The current scope includes:
 - Hard boundary condition projection through `bc` during training and inference rollout
 - Weighted autoregressive NMSE training with rollout curriculum and noise decay
 - Deterministic first-frame reconstruction from `case_<label>` and mesh coordinates
-- `FlowTwin` axisymmetric `Vy` rendering for 2D-to-3D digital-twin videos
+- `FlowTwin` axisymmetric scalar-field and vorticity rendering for 2D-to-3D digital-twin videos
 
 ## 🧱 Repository Layout
 
@@ -150,7 +150,7 @@ runs/
 ├── <label>_pred.pt
 ├── <label>_full.mp4
 ├── <label>_focus_vy.mp4
-└── <label>_twin_vy.mp4
+└── <label>_twin_vorticity.mp4
 ```
 
 Checkpoints store model arguments, graph settings, and `bc` state in `params`, while state and coordinate scalers are stored separately in `scaler_state_dict`.

@@ -23,7 +23,7 @@ from utils.hue_logger import hue, logger
 
 class FlowTwin:
     """
-    Render a 3D axisymmetric cutaway Vy-field twin from HyperFlowNet prediction.
+    Render a 3D axisymmetric cutaway flow twin from HyperFlowNet prediction.
     """
 
     def __init__(self, output_dir: str | Path, channel_names: Sequence[str]) -> None:
@@ -193,6 +193,20 @@ class FlowTwin:
             lo, hi = center - 1e-6, center + 1e-6
         return lo, hi
 
+    def _signed_clim(self, data: np.ndarray) -> Tuple[float, float]:
+        """
+        Compute symmetric scalar limits for signed derived fields.
+
+        Args:
+            data (np.ndarray): Scalar field sequence. (T, N).
+
+        Returns:
+            Tuple[float, float]: Symmetric scalar limits.
+        """
+        lo, hi = self._clim(data)
+        vmax = max(abs(lo), abs(hi))
+        return -vmax, vmax
+
     def _value_cmap(self, ch_idx: int, clim: Tuple[float, float]) -> Colormap:
         """
         Pick the FlowVis-style scalar colormap for one channel.
@@ -222,9 +236,98 @@ class FlowTwin:
         """
         lo, hi = self._clim(data)
         if _channel_role(ch_idx, 2) == "velocity" and lo < 0.0 < hi:
-            vmax = max(abs(lo), abs(hi))
-            lo, hi = -vmax, vmax
+            lo, hi = self._signed_clim(data)
         return lo, hi
+
+    def _gradient_stencil(self, coords: Tensor) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Build local least-squares gradient weights on the irregular 2D mesh.
+
+        Args:
+            coords (Tensor): Axisymmetric coordinates. (N, 2).
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: Neighbor indices (N, K) and derivative weights. (N, K, 2).
+        """
+        pts = coords.detach().cpu().numpy().astype(np.float32)
+        _, idx = cKDTree(pts).query(pts, k=25)
+        idx = idx[:, 1:]
+        weights = np.empty((idx.shape[0], idx.shape[1], 2), dtype=np.float32)
+
+        for node_idx in range(idx.shape[0]):
+            delta = pts[idx[node_idx]] - pts[node_idx]
+            dist = np.linalg.norm(delta, axis=1) + 1.0e-12
+            weights[node_idx] = (np.linalg.pinv(delta / dist[:, None]) / dist[None, :]).T
+
+        return idx.astype(np.int64), weights
+
+    def _derivative(self, data: np.ndarray, idx: np.ndarray, weights: np.ndarray, axis_idx: int) -> np.ndarray:
+        """
+        Apply a precomputed least-squares derivative stencil.
+
+        Args:
+            data (np.ndarray): Scalar field sequence. (T, N).
+            idx (np.ndarray): Neighbor indices. (N, K).
+            weights (np.ndarray): Derivative weights. (N, K, 2).
+            axis_idx (int): Coordinate derivative axis.
+
+        Returns:
+            np.ndarray: Spatial derivative sequence. (T, N).
+        """
+        deriv = np.empty_like(data)
+        for start in range(0, data.shape[1], 512):
+            end = min(start + 512, data.shape[1])
+            local_weights = weights[start:end, :, axis_idx]
+            deriv[:, start:end] = (
+                np.sum(data[:, idx[start:end]] * local_weights[None, :, :], axis=2)
+                - data[:, start:end] * np.sum(local_weights, axis=1)[None, :]
+            )
+        return deriv
+
+    def _vorticity(self, pred: Tensor, coords: Tensor) -> np.ndarray:
+        """
+        Compute the axisymmetric no-swirl circumferential vorticity.
+
+        Args:
+            pred (Tensor): Predicted flow sequence. (T, N, C).
+            coords (Tensor): Axisymmetric coordinates. (N, 2).
+
+        Returns:
+            np.ndarray: Vorticity sequence. (T, N).
+        """
+        data = pred.detach().cpu().numpy().astype(np.float32)
+        idx, weights = self._gradient_stencil(coords)
+        vx = data[:, :, self.ch_names.index("Vx")]
+        vy = data[:, :, self.ch_names.index("Vy")]
+        return self._derivative(vy, idx, weights, 0) - self._derivative(vx, idx, weights, 1)
+
+    def _render_field(
+        self,
+        pred: Tensor,
+        coords: Tensor,
+        field_name: str,
+    ) -> Tuple[np.ndarray, str, str, Tuple[float, float], Colormap]:
+        """
+        Resolve one requested flow-twin scalar field.
+
+        Args:
+            pred (Tensor): Predicted flow sequence. (T, N, C).
+            coords (Tensor): Axisymmetric coordinates. (N, 2).
+            field_name (str): Field name, one of Vx, Vy, P, T, or Vorticity.
+
+        Returns:
+            Tuple[np.ndarray, str, str, Tuple[float, float], Colormap]: Field, label, file tag, limits, and colormap.
+        """
+        if field_name.lower() in {"vorticity", "omega"}:
+            field = self._vorticity(pred, coords)
+            return field, "Vorticity", "vorticity", self._signed_clim(field), _CMAP["velocity"]
+
+        channel_lookup = {name.lower(): idx for idx, name in enumerate(self.ch_names)}
+        ch_idx = channel_lookup[field_name.lower()]
+        field = pred.detach().cpu().numpy().astype(np.float32)[:, :, ch_idx]
+        channel_name = self.ch_names[ch_idx]
+        clim = self._channel_clim(field, ch_idx)
+        return field, channel_name, channel_name.lower(), clim, self._value_cmap(ch_idx, clim)
 
     def _sbar_args(self, channel_name: str) -> dict:
         """
@@ -311,9 +414,17 @@ class FlowTwin:
     # Public interface
     # ============================================================
 
-    def render(self, pred: Tensor, coords: Tensor, label: str, num_nodes: int, num_params: int) -> Path:
+    def render(
+        self,
+        pred: Tensor,
+        coords: Tensor,
+        label: str,
+        num_nodes: int,
+        num_params: int,
+        field_name: str = "Vy",
+    ) -> Path:
         """
-        Render one 3D quarter-cut MP4 for the predicted Vy field.
+        Render one 3D quarter-cut MP4 for a predicted scalar field.
 
         Args:
             pred (Tensor): Predicted flow sequence. (T, N, C).
@@ -321,15 +432,12 @@ class FlowTwin:
             label (str): Operating-condition label.
             num_nodes (int): Total node count.
             num_params (int): Model parameter count.
+            field_name (str): Field name, one of Vx, Vy, P, T, or Vorticity.
 
         Returns:
             Path: Rendered MP4 path.
         """
-        ch_idx = self.ch_names.index("Vy")
-        channel_name = self.ch_names[ch_idx]
-        field = pred.detach().cpu().numpy().astype(np.float32)[:, :, ch_idx]
-        clim = self._channel_clim(field, ch_idx)
-        cmap = self._value_cmap(ch_idx, clim)
+        field, field_label, file_tag, clim, cmap = self._render_field(pred, coords, field_name)
 
         points = self._section_points(coords)
         section_2d = self._section_mesh(points)
@@ -364,7 +472,7 @@ class FlowTwin:
             clim=clim,
             lighting=False,
             smooth_shading=True,
-            scalar_bar_args=self._sbar_args(channel_name),
+            scalar_bar_args=self._sbar_args(field_label),
         )
         plotter.add_mesh(
             section_z,
@@ -388,7 +496,13 @@ class FlowTwin:
 
         title = f"HyperFlowNet (nodes: {num_nodes:,}, params: {num_params:,})"
         plotter.add_text(title, position="upper_edge", font_size=15, color="black", font="arial")
-        plotter.add_text(f"{channel_name} (label {label})", position="upper_left", font_size=18, color="black", font="arial")
+        plotter.add_text(
+            f"{field_label} (label {label})",
+            position="upper_left",
+            font_size=18,
+            color="black",
+            font="arial",
+        )
 
         for light in (
             pv.Light(position=(2.5, 4.0, 3.2), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.78),
@@ -401,7 +515,7 @@ class FlowTwin:
             section_y.point_data["scalar"] = field[step_idx, section_ids]
             section_z.point_data["scalar"] = field[step_idx, section_ids]
 
-        out_path = self.output_dir / f"{label}_twin_{channel_name.lower()}.mp4"
+        out_path = self.output_dir / f"{label}_twin_{file_tag}.mp4"
         self._mp4(plotter, _update, field.shape[0], out_path, desc=f"Rendering {label} 3D twin")
         logger.info(f"3D flow twin saved to {hue.g}{out_path}{hue.q}")
         return out_path
