@@ -23,7 +23,7 @@ from utils.hue_logger import hue, logger
 
 class FlowTwin:
     """
-    Render a 3D axisymmetric cutaway flow twin from HyperFlowNet prediction.
+    Render a 3D axisymmetric flow twin from HyperFlowNet prediction.
     """
 
     def __init__(self, output_dir: str | Path, channel_names: Sequence[str]) -> None:
@@ -146,6 +146,157 @@ class FlowTwin:
             rotation_axis=(1, 0, 0),
             capping=False,
         )
+
+    def _scalar_bar_anchor(self, clim: Tuple[float, float]) -> pv.PolyData:
+        """
+        Build an invisible point cloud that owns the scalar bar.
+
+        Args:
+            clim (Tuple[float, float]): Scalar limits.
+
+        Returns:
+            pv.PolyData: Two-point scalar anchor.
+        """
+        anchor = pv.PolyData(np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32))
+        anchor.point_data["scalar"] = np.array(clim, dtype=np.float32)
+        return anchor
+
+    def _iso_levels(self, clim: Tuple[float, float], signed: bool) -> np.ndarray:
+        """
+        Choose fixed isosurface levels inside the rendered scalar range.
+
+        Args:
+            clim (Tuple[float, float]): Scalar limits.
+            signed (bool): Whether the field is a signed velocity-like field.
+
+        Returns:
+            np.ndarray: Isosurface levels. (L,).
+        """
+        lo, hi = clim
+        if signed:
+            vmax = min(abs(lo), abs(hi))
+            return np.array([-0.70, -0.38, 0.38, 0.70], dtype=np.float32) * vmax
+        span = hi - lo
+        return lo + np.array([0.24, 0.43, 0.62, 0.81], dtype=np.float32) * span
+
+    def _axisymmetric_isosurface(self, mesh: pv.PolyData, scalar: np.ndarray, level: float) -> pv.PolyData:
+        """
+        Revolve one section contour around the x-axis into a 3D isosurface.
+
+        Args:
+            mesh (pv.PolyData): Axisymmetric section mesh.
+            scalar (np.ndarray): Scalar values on mesh points. (N,).
+            level (float): Isosurface level.
+
+        Returns:
+            pv.PolyData: Axisymmetric isosurface.
+        """
+        section = mesh.copy()
+        section.point_data["scalar"] = scalar
+        contour = section.contour(isosurfaces=[float(level)], scalars="scalar")
+        if contour.n_points == 0 or contour.n_cells == 0:
+            return pv.PolyData()
+
+        surface = contour.extrude_rotate(
+            resolution=72,
+            angle=360.0,
+            rotation_axis=(1, 0, 0),
+            capping=False,
+        )
+        surface = surface.triangulate()
+        surface.point_data["scalar"] = np.full(surface.n_points, level, dtype=np.float32)
+        return surface
+
+    def _scene_geometry(self, coords: Tensor) -> tuple[pv.PolyData, np.ndarray, pv.PolyData, pv.PolyData, pv.PolyData]:
+        """
+        Build the shared cutaway shell, rims, and section mesh.
+
+        Args:
+            coords (Tensor): Axisymmetric coordinates. (N, 2).
+
+        Returns:
+            tuple[pv.PolyData, np.ndarray, pv.PolyData, pv.PolyData, pv.PolyData]: Section, ids, rims, and shell.
+        """
+        section_2d = self._section_mesh(self._section_points(coords))
+        section_ids = section_2d.point_data["node_id"].astype(np.int64)
+        rim_y = self._rotate_section(self._boundary_mesh(section_2d), 0.0)
+        rim_z = self._rotate_section(self._boundary_mesh(section_2d), 90.0)
+        return section_2d, section_ids, rim_y, rim_z, self._pipe_shell(section_2d)
+
+    def _plotter(self, shell: pv.PolyData, rim_y: pv.PolyData, rim_z: pv.PolyData) -> pv.Plotter:
+        """
+        Create the shared cutaway plotter scene.
+
+        Args:
+            shell (pv.PolyData): Metallic pipe shell.
+            rim_y (pv.PolyData): First cut rim.
+            rim_z (pv.PolyData): Second cut rim.
+
+        Returns:
+            pv.Plotter: Configured plotter.
+        """
+        plotter = pv.Plotter(off_screen=True, window_size=(1920, 1080))
+        plotter.set_background("white")
+        plotter.enable_anti_aliasing("msaa", multi_samples=8)
+        plotter.add_mesh(
+            shell,
+            color=(0.92, 0.93, 0.92),
+            opacity=0.96,
+            smooth_shading=True,
+            show_scalar_bar=False,
+            ambient=0.46,
+            diffuse=0.58,
+            specular=0.72,
+            specular_power=72,
+        )
+        for rim in (rim_y, rim_z):
+            plotter.add_mesh(
+                rim,
+                color=(0.58, 0.60, 0.60),
+                line_width=2.0,
+                render_lines_as_tubes=True,
+                show_scalar_bar=False,
+                specular=0.75,
+                specular_power=72,
+            )
+        return plotter
+
+    def _finish_scene(
+        self,
+        plotter: pv.Plotter,
+        shell: pv.PolyData,
+        field_label: str,
+        label: str,
+        num_nodes: int,
+        num_params: int,
+    ) -> None:
+        """
+        Add shared labels, lights, and camera.
+
+        Args:
+            plotter (pv.Plotter): Active plotter.
+            shell (pv.PolyData): Metallic pipe shell.
+            field_label (str): Rendered field label.
+            label (str): Operating-condition label.
+            num_nodes (int): Total node count.
+            num_params (int): Model parameter count.
+        """
+        title = f"HyperFlowNet (nodes: {num_nodes:,}, params: {num_params:,})"
+        plotter.add_text(title, position="upper_edge", font_size=15, color="black", font="arial")
+        plotter.add_text(
+            f"{field_label} (label {label})",
+            position="upper_left",
+            font_size=18,
+            color="black",
+            font="arial",
+        )
+
+        for light in (
+            pv.Light(position=(2.5, 4.0, 3.2), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.78),
+            pv.Light(position=(-1.6, -2.5, 1.8), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.48),
+        ):
+            plotter.add_light(light)
+        self._camera(plotter, shell)
 
     def _camera(self, plotter: pv.Plotter, mesh: pv.PolyData) -> None:
         """
@@ -441,61 +592,49 @@ class FlowTwin:
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg exited with code {proc.returncode}. Ensure ffmpeg is on PATH.")
 
-    # ============================================================
-    # Public interface
-    # ============================================================
-
-    def render(
+    def _render_section(
         self,
-        pred: Tensor,
-        coords: Tensor,
+        field: np.ndarray,
+        field_label: str,
+        clim: Tuple[float, float],
+        cmap: Colormap,
+        section_2d: pv.PolyData,
+        section_ids: np.ndarray,
+        rim_y: pv.PolyData,
+        rim_z: pv.PolyData,
+        shell: pv.PolyData,
         label: str,
         num_nodes: int,
         num_params: int,
-        field_name: str = "Vy",
+        out_path: Path,
     ) -> Path:
         """
-        Render one 3D quarter-cut MP4 for a predicted scalar field.
+        Render the cutaway section-cloud flow twin.
 
         Args:
-            pred (Tensor): Predicted flow sequence. (T, N, C).
-            coords (Tensor): Axisymmetric coordinates. (N, 2).
+            field (np.ndarray): Scalar field sequence. (T, N).
+            field_label (str): Rendered field label.
+            clim (Tuple[float, float]): Scalar limits.
+            cmap (Colormap): Scalar colormap.
+            section_2d (pv.PolyData): Axisymmetric section mesh.
+            section_ids (np.ndarray): Mesh point node indices. (N,).
+            rim_y (pv.PolyData): First cut rim.
+            rim_z (pv.PolyData): Second cut rim.
+            shell (pv.PolyData): Metallic pipe shell.
             label (str): Operating-condition label.
             num_nodes (int): Total node count.
             num_params (int): Model parameter count.
-            field_name (str): Field name, one of Vx, Vy, P, T, or Vorticity.
+            out_path (Path): Output MP4 path.
 
         Returns:
             Path: Rendered MP4 path.
         """
-        field, field_label, file_tag, clim, cmap = self._render_field(pred, coords, field_name)
-
-        points = self._section_points(coords)
-        section_2d = self._section_mesh(points)
-        section_ids = section_2d.point_data["node_id"].astype(np.int64)
         section_y = self._rotate_section(section_2d, 0.0)
         section_z = self._rotate_section(section_2d, 90.0)
-        rim_y = self._rotate_section(self._boundary_mesh(section_2d), 0.0)
-        rim_z = self._rotate_section(self._boundary_mesh(section_2d), 90.0)
-        shell = self._pipe_shell(section_2d)
-
         section_y.point_data["scalar"] = field[0, section_ids]
         section_z.point_data["scalar"] = field[0, section_ids]
 
-        plotter = pv.Plotter(off_screen=True, window_size=(1920, 1080))
-        plotter.set_background("white")
-        plotter.enable_anti_aliasing("msaa", multi_samples=8)
-        plotter.add_mesh(
-            shell,
-            color=(0.92, 0.93, 0.92),
-            opacity=0.96,
-            smooth_shading=True,
-            show_scalar_bar=False,
-            ambient=0.46,
-            diffuse=0.58,
-            specular=0.72,
-            specular_power=72,
-        )
+        plotter = self._plotter(shell, rim_y, rim_z)
         plotter.add_mesh(
             section_y,
             scalars="scalar",
@@ -514,39 +653,169 @@ class FlowTwin:
             smooth_shading=True,
             show_scalar_bar=False,
         )
-        for rim in (rim_y, rim_z):
-            plotter.add_mesh(
-                rim,
-                color=(0.58, 0.60, 0.60),
-                line_width=2.0,
-                render_lines_as_tubes=True,
-                show_scalar_bar=False,
-                specular=0.75,
-                specular_power=72,
-            )
-
-        title = f"HyperFlowNet (nodes: {num_nodes:,}, params: {num_params:,})"
-        plotter.add_text(title, position="upper_edge", font_size=15, color="black", font="arial")
-        plotter.add_text(
-            f"{field_label} (label {label})",
-            position="upper_left",
-            font_size=18,
-            color="black",
-            font="arial",
-        )
-
-        for light in (
-            pv.Light(position=(2.5, 4.0, 3.2), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.78),
-            pv.Light(position=(-1.6, -2.5, 1.8), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.48),
-        ):
-            plotter.add_light(light)
-        self._camera(plotter, shell)
+        self._finish_scene(plotter, shell, field_label, label, num_nodes, num_params)
 
         def _update(step_idx: int) -> None:
             section_y.point_data["scalar"] = field[step_idx, section_ids]
             section_z.point_data["scalar"] = field[step_idx, section_ids]
 
-        out_path = self.output_dir / f"{label}_twin_{file_tag}.mp4"
-        self._mp4(plotter, _update, field.shape[0], out_path, desc=f"Rendering {label} 3D twin")
+        self._mp4(plotter, _update, field.shape[0], out_path, desc=f"Rendering {label} 3D section twin")
         logger.info(f"3D flow twin saved to {hue.g}{out_path}{hue.q}")
         return out_path
+
+    def _render_isosurface(
+        self,
+        field: np.ndarray,
+        field_label: str,
+        clim: Tuple[float, float],
+        cmap: Colormap,
+        section_2d: pv.PolyData,
+        section_ids: np.ndarray,
+        rim_y: pv.PolyData,
+        rim_z: pv.PolyData,
+        shell: pv.PolyData,
+        label: str,
+        num_nodes: int,
+        num_params: int,
+        out_path: Path,
+    ) -> Path:
+        """
+        Render the axisymmetric isosurface flow twin.
+
+        Args:
+            field (np.ndarray): Scalar field sequence. (T, N).
+            field_label (str): Rendered field label.
+            clim (Tuple[float, float]): Scalar limits.
+            cmap (Colormap): Scalar colormap.
+            section_2d (pv.PolyData): Axisymmetric section mesh.
+            section_ids (np.ndarray): Mesh point node indices. (N,).
+            rim_y (pv.PolyData): First cut rim.
+            rim_z (pv.PolyData): Second cut rim.
+            shell (pv.PolyData): Metallic pipe shell.
+            label (str): Operating-condition label.
+            num_nodes (int): Total node count.
+            num_params (int): Model parameter count.
+            out_path (Path): Output MP4 path.
+
+        Returns:
+            Path: Rendered MP4 path.
+        """
+        levels = self._iso_levels(clim, field_label in {"Vx", "Vy", "Vorticity"})
+        plotter = self._plotter(shell, rim_y, rim_z)
+        plotter.add_mesh(
+            self._scalar_bar_anchor(clim),
+            scalars="scalar",
+            cmap=cmap,
+            clim=clim,
+            opacity=0.0,
+            show_scalar_bar=True,
+            scalar_bar_args=self._sbar_args(field_label),
+            pickable=False,
+        )
+        iso_actors = []
+
+        def _draw_isosurfaces(step_idx: int) -> None:
+            nonlocal iso_actors
+            for actor in iso_actors:
+                plotter.remove_actor(actor, render=False)
+
+            iso_actors = []
+            scalar = field[step_idx, section_ids]
+            for level in levels:
+                surface = self._axisymmetric_isosurface(section_2d, scalar, float(level))
+                if surface.n_points == 0 or surface.n_cells == 0:
+                    continue
+                actor = plotter.add_mesh(
+                    surface,
+                    scalars="scalar",
+                    cmap=cmap,
+                    clim=clim,
+                    opacity=0.58,
+                    smooth_shading=True,
+                    show_scalar_bar=False,
+                    ambient=0.46,
+                    diffuse=0.62,
+                    specular=0.22,
+                    specular_power=24,
+                    render=False,
+                )
+                iso_actors.append(actor)
+
+        _draw_isosurfaces(0)
+        self._finish_scene(plotter, shell, field_label, label, num_nodes, num_params)
+
+        def _update(step_idx: int) -> None:
+            _draw_isosurfaces(step_idx)
+
+        self._mp4(plotter, _update, field.shape[0], out_path, desc=f"Rendering {label} 3D isosurface twin")
+        logger.info(f"3D flow twin saved to {hue.g}{out_path}{hue.q}")
+        return out_path
+
+    # ============================================================
+    # Public interface
+    # ============================================================
+
+    def render(
+        self,
+        pred: Tensor,
+        coords: Tensor,
+        label: str,
+        num_nodes: int,
+        num_params: int,
+        field_name: str = "Vy",
+        render_mode: str = "section",
+    ) -> Path:
+        """
+        Render one 3D quarter-cut MP4 for a predicted scalar field.
+
+        Args:
+            pred (Tensor): Predicted flow sequence. (T, N, C).
+            coords (Tensor): Axisymmetric coordinates. (N, 2).
+            label (str): Operating-condition label.
+            num_nodes (int): Total node count.
+            num_params (int): Model parameter count.
+            field_name (str): Field name, one of Vx, Vy, P, T, or Vorticity.
+            render_mode (str): Rendering mode, either section or isosurface.
+
+        Returns:
+            Path: Rendered MP4 path.
+        """
+        field, field_label, file_tag, clim, cmap = self._render_field(pred, coords, field_name)
+        section_2d, section_ids, rim_y, rim_z, shell = self._scene_geometry(coords)
+        mode_tag = {"section": "section", "cloud": "section", "isosurface": "isosurface", "iso": "isosurface"}[
+            render_mode.lower()
+        ]
+        out_path = self.output_dir / f"{label}_twin_{file_tag}_{mode_tag}.mp4"
+
+        if mode_tag == "section":
+            return self._render_section(
+                field,
+                field_label,
+                clim,
+                cmap,
+                section_2d,
+                section_ids,
+                rim_y,
+                rim_z,
+                shell,
+                label,
+                num_nodes,
+                num_params,
+                out_path,
+            )
+
+        return self._render_isosurface(
+            field,
+            field_label,
+            clim,
+            cmap,
+            section_2d,
+            section_ids,
+            rim_y,
+            rim_z,
+            shell,
+            label,
+            num_nodes,
+            num_params,
+            out_path,
+        )

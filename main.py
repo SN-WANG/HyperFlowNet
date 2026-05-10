@@ -600,6 +600,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
             num_nodes=int(coords_raw.shape[0]),
             num_params=total_params,
             field_name="Vorticity",
+            render_mode="section",
         )
 
     with open(output_dir / "metrics.json", "w") as f:
