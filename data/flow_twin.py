@@ -160,16 +160,16 @@ class FlowTwin:
         length = (x_max - x_min) or 1.0
         diameter = max(y_max - y_min, z_max - z_min, 1.0)
 
-        plotter.camera.focal_point = (cx, cy, cz)
+        plotter.camera.focal_point = (cx, cy, cz - 0.18 * diameter)
         plotter.camera.position = (
             cx + 1.08 * length,
             cy + 2.05 * diameter,
-            cz + 1.38 * diameter,
+            cz + 1.20 * diameter,
         )
         plotter.camera.up = (0.0, 0.0, 1.0)
         plotter.camera.view_angle = 28.0
         plotter.camera.parallel_projection = False
-        plotter.camera.zoom(0.88)
+        plotter.camera.zoom(0.94)
         plotter.reset_camera_clipping_range()
 
     # ============================================================
@@ -244,7 +244,8 @@ class FlowTwin:
             "position_y": 0.055,
             "vertical": False,
             "fmt": "%.2e",
-            "color": "white",
+            "color": "black",
+            "font_family": "arial",
             "title_font_size": 14,
             "label_font_size": 12,
         }
@@ -343,21 +344,18 @@ class FlowTwin:
         section_z.point_data["scalar"] = field[0, section_ids]
 
         plotter = pv.Plotter(off_screen=True, window_size=(1920, 1080))
-        plotter.set_background((0.015, 0.018, 0.022))
+        plotter.set_background("white")
         plotter.enable_anti_aliasing("msaa", multi_samples=8)
         plotter.add_mesh(
             shell,
-            color=(0.86, 0.88, 0.88),
-            opacity=0.92,
+            color=(0.92, 0.93, 0.92),
+            opacity=0.96,
             smooth_shading=True,
             show_scalar_bar=False,
-            ambient=0.22,
-            diffuse=0.56,
-            specular=0.95,
-            specular_power=96,
-            pbr=True,
-            metallic=0.72,
-            roughness=0.18,
+            ambient=0.46,
+            diffuse=0.58,
+            specular=0.72,
+            specular_power=72,
         )
         plotter.add_mesh(
             section_y,
@@ -380,7 +378,7 @@ class FlowTwin:
         for rim in (rim_y, rim_z):
             plotter.add_mesh(
                 rim,
-                color=(0.95, 0.96, 0.95),
+                color=(0.58, 0.60, 0.60),
                 line_width=2.0,
                 render_lines_as_tubes=True,
                 show_scalar_bar=False,
@@ -389,12 +387,12 @@ class FlowTwin:
             )
 
         title = f"HyperFlowNet (nodes: {num_nodes:,}, params: {num_params:,})"
-        plotter.add_text(title, position="upper_edge", font_size=15, color="white")
-        plotter.add_text(f"{channel_name} (label {label})", position="upper_left", font_size=18, color="white")
+        plotter.add_text(title, position="upper_edge", font_size=15, color="black", font="arial")
+        plotter.add_text(f"{channel_name} (label {label})", position="upper_left", font_size=18, color="black", font="arial")
 
         for light in (
-            pv.Light(position=(2.5, 4.0, 3.2), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.95),
-            pv.Light(position=(-1.6, -2.5, 1.8), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.32),
+            pv.Light(position=(2.5, 4.0, 3.2), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.78),
+            pv.Light(position=(-1.6, -2.5, 1.8), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.48),
         ):
             plotter.add_light(light)
         self._camera(plotter, shell)
