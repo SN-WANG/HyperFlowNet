@@ -23,7 +23,7 @@ from utils.hue_logger import hue, logger
 
 class FlowTwin:
     """
-    Render a 3D axisymmetric Vy-field digital twin from HyperFlowNet prediction.
+    Render a 3D axisymmetric cutaway Vy-field twin from HyperFlowNet prediction.
     """
 
     def __init__(self, output_dir: str | Path, channel_names: Sequence[str]) -> None:
@@ -76,18 +76,19 @@ class FlowTwin:
         alpha = float(np.mean(dd[:, 1])) * 2.5
         return cloud.delaunay_2d(alpha=alpha).triangulate()
 
-    def _rotate_section(self, mesh: pv.PolyData) -> pv.PolyData:
+    def _rotate_section(self, mesh: pv.PolyData, angle_deg: float) -> pv.PolyData:
         """
         Rotate the internal 2D section into the 3D pipe volume.
 
         Args:
             mesh (pv.PolyData): Axisymmetric section mesh.
+            angle_deg (float): Azimuthal angle in degrees.
 
         Returns:
             pv.PolyData: Rotated internal section.
         """
         section = mesh.copy()
-        theta = np.deg2rad(32.0)
+        theta = np.deg2rad(angle_deg)
         points = section.points.copy()
         radius = points[:, 1].copy()
         points[:, 1] = radius * np.cos(theta)
@@ -95,58 +96,60 @@ class FlowTwin:
         section.points = points
         return section
 
-    def _full_section_mesh(self, mesh: pv.PolyData) -> pv.PolyData:
+    def _boundary_mesh(self, mesh: pv.PolyData) -> pv.PolyData:
         """
-        Mirror one radial section into a full-diameter section.
-
-        Args:
-            mesh (pv.PolyData): One-sided axisymmetric section mesh.
-
-        Returns:
-            pv.PolyData: Full-diameter section mesh.
-        """
-        points = mesh.points.copy()
-        mirrored_points = points.copy()
-        mirrored_points[:, 1] *= -1.0
-
-        faces = mesh.faces.reshape(-1, 4)
-        mirrored_faces = faces.copy()
-        mirrored_faces[:, 1:] += points.shape[0]
-        mirrored_faces[:, [2, 3]] = mirrored_faces[:, [3, 2]]
-
-        section = pv.PolyData(
-            np.vstack([points, mirrored_points]),
-            np.vstack([faces, mirrored_faces]).ravel(),
-        )
-        section.point_data["node_id"] = np.concatenate([mesh.point_data["node_id"], mesh.point_data["node_id"]])
-        return section
-
-    def _pipe_shell(self, mesh: pv.PolyData) -> pv.PolyData:
-        """
-        Revolve the section boundary by 360 degrees to build the pipe shell.
+        Extract the exposed section boundary.
 
         Args:
             mesh (pv.PolyData): Axisymmetric section mesh.
 
         Returns:
-            pv.PolyData: Rotated pipe shell.
+            pv.PolyData: Boundary line mesh.
         """
-        boundary = mesh.extract_feature_edges(
+        return mesh.extract_feature_edges(
             boundary_edges=True,
             feature_edges=False,
             manifold_edges=False,
             non_manifold_edges=False,
         )
+
+    def _outer_boundary_mesh(self, mesh: pv.PolyData) -> pv.PolyData:
+        """
+        Extract non-axis boundary edges for the metallic outer shell.
+
+        Args:
+            mesh (pv.PolyData): Axisymmetric section mesh.
+
+        Returns:
+            pv.PolyData: Outer boundary line mesh.
+        """
+        boundary = self._boundary_mesh(mesh)
+        lines = boundary.lines.reshape(-1, 3)
+        radius = np.abs(boundary.points[:, 1])
+        keep = np.max(radius[lines[:, 1:]], axis=1) > 1.0e-4
+        return pv.PolyData(boundary.points, lines[keep].ravel()).clean()
+
+    def _pipe_shell(self, mesh: pv.PolyData) -> pv.PolyData:
+        """
+        Revolve the outer boundary by 270 degrees to build the quarter-cut shell.
+
+        Args:
+            mesh (pv.PolyData): Axisymmetric section mesh.
+
+        Returns:
+            pv.PolyData: Quarter-cut pipe shell.
+        """
+        boundary = self._rotate_section(self._outer_boundary_mesh(mesh), 90.0)
         return boundary.extrude_rotate(
-            resolution=72,
-            angle=360.0,
+            resolution=96,
+            angle=270.0,
             rotation_axis=(1, 0, 0),
-            capping=True,
+            capping=False,
         )
 
     def _camera(self, plotter: pv.Plotter, mesh: pv.PolyData) -> None:
         """
-        Set a perspective camera with visible depth.
+        Set a perspective camera looking into the quarter-cut opening.
 
         Args:
             plotter (pv.Plotter): Active plotter.
@@ -159,14 +162,14 @@ class FlowTwin:
 
         plotter.camera.focal_point = (cx, cy, cz)
         plotter.camera.position = (
-            cx + 1.20 * length,
-            cy - 2.45 * diameter,
-            cz + 1.15 * diameter,
+            cx + 1.08 * length,
+            cy + 2.05 * diameter,
+            cz + 1.38 * diameter,
         )
         plotter.camera.up = (0.0, 0.0, 1.0)
-        plotter.camera.view_angle = 26.0
+        plotter.camera.view_angle = 28.0
         plotter.camera.parallel_projection = False
-        plotter.camera.zoom(0.84)
+        plotter.camera.zoom(0.88)
         plotter.reset_camera_clipping_range()
 
     # ============================================================
@@ -241,6 +244,7 @@ class FlowTwin:
             "position_y": 0.055,
             "vertical": False,
             "fmt": "%.2e",
+            "color": "white",
             "title_font_size": 14,
             "label_font_size": 12,
         }
@@ -308,7 +312,7 @@ class FlowTwin:
 
     def render(self, pred: Tensor, coords: Tensor, label: str, num_nodes: int, num_params: int) -> Path:
         """
-        Render one 3D MP4 for the predicted Vy field.
+        Render one 3D quarter-cut MP4 for the predicted Vy field.
 
         Args:
             pred (Tensor): Predicted flow sequence. (T, N, C).
@@ -328,27 +332,35 @@ class FlowTwin:
 
         points = self._section_points(coords)
         section_2d = self._section_mesh(points)
-        section_full = self._full_section_mesh(section_2d)
-        section_ids = section_full.point_data["node_id"].astype(np.int64)
-        section = self._rotate_section(section_full)
+        section_ids = section_2d.point_data["node_id"].astype(np.int64)
+        section_y = self._rotate_section(section_2d, 0.0)
+        section_z = self._rotate_section(section_2d, 90.0)
+        rim_y = self._rotate_section(self._boundary_mesh(section_2d), 0.0)
+        rim_z = self._rotate_section(self._boundary_mesh(section_2d), 90.0)
         shell = self._pipe_shell(section_2d)
 
-        section.point_data["scalar"] = field[0, section_ids]
+        section_y.point_data["scalar"] = field[0, section_ids]
+        section_z.point_data["scalar"] = field[0, section_ids]
 
         plotter = pv.Plotter(off_screen=True, window_size=(1920, 1080))
-        plotter.set_background("white")
+        plotter.set_background((0.015, 0.018, 0.022))
         plotter.enable_anti_aliasing("msaa", multi_samples=8)
         plotter.add_mesh(
             shell,
-            color=(0.60, 0.62, 0.64),
-            opacity=0.24,
+            color=(0.86, 0.88, 0.88),
+            opacity=0.92,
             smooth_shading=True,
             show_scalar_bar=False,
-            specular=0.25,
-            specular_power=18,
+            ambient=0.22,
+            diffuse=0.56,
+            specular=0.95,
+            specular_power=96,
+            pbr=True,
+            metallic=0.72,
+            roughness=0.18,
         )
         plotter.add_mesh(
-            section,
+            section_y,
             scalars="scalar",
             cmap=cmap,
             clim=clim,
@@ -356,17 +368,40 @@ class FlowTwin:
             smooth_shading=True,
             scalar_bar_args=self._sbar_args(channel_name),
         )
+        plotter.add_mesh(
+            section_z,
+            scalars="scalar",
+            cmap=cmap,
+            clim=clim,
+            lighting=False,
+            smooth_shading=True,
+            show_scalar_bar=False,
+        )
+        for rim in (rim_y, rim_z):
+            plotter.add_mesh(
+                rim,
+                color=(0.95, 0.96, 0.95),
+                line_width=2.0,
+                render_lines_as_tubes=True,
+                show_scalar_bar=False,
+                specular=0.75,
+                specular_power=72,
+            )
 
         title = f"HyperFlowNet (nodes: {num_nodes:,}, params: {num_params:,})"
-        plotter.add_text(title, position="upper_edge", font_size=15, color="black")
-        plotter.add_text(f"{channel_name} (label {label})", position="upper_left", font_size=18, color="black")
+        plotter.add_text(title, position="upper_edge", font_size=15, color="white")
+        plotter.add_text(f"{channel_name} (label {label})", position="upper_left", font_size=18, color="white")
 
-        light = pv.Light(position=(2.0, -3.0, 3.0), focal_point=(0.0, 0.0, 0.0), color="white", intensity=0.8)
-        plotter.add_light(light)
+        for light in (
+            pv.Light(position=(2.5, 4.0, 3.2), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.95),
+            pv.Light(position=(-1.6, -2.5, 1.8), focal_point=(1.8, 0.0, 0.0), color="white", intensity=0.32),
+        ):
+            plotter.add_light(light)
         self._camera(plotter, shell)
 
         def _update(step_idx: int) -> None:
-            section.point_data["scalar"] = field[step_idx, section_ids]
+            section_y.point_data["scalar"] = field[step_idx, section_ids]
+            section_z.point_data["scalar"] = field[step_idx, section_ids]
 
         out_path = self.output_dir / f"{label}_twin_{channel_name.lower()}.mp4"
         self._mp4(plotter, _update, field.shape[0], out_path, desc=f"Rendering {label} 3D twin")
