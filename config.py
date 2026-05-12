@@ -91,7 +91,7 @@ def get_args() -> argparse.Namespace:
 
     model = parser.add_argument_group("Model")
     model.add_argument(
-        "--graph_mode", type=str, default="bias", choices=["bias", "assign"], help="Graph injection mode.",
+        "--graph_mode", type=str, default="bias", choices=["bias", "assign", "none"], help="Graph injection mode.",
     )
     model.add_argument(
         "--depth", type=int, default=4, help="Number of stacked HyperFlowNet blocks."
@@ -149,16 +149,52 @@ def get_args() -> argparse.Namespace:
     )
 
     # ============================================================
-    # 4. Boundary Condition
+    # 4. Ablation
     # ============================================================
 
-    boundary = parser.add_argument_group("Boundary Condition")
-    boundary.add_argument(
+    ablation = parser.add_argument_group("Ablation")
+    ablation.add_argument(
+        "--use_graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Inject the local graph into HyperFlowNet slice attention.",
+    )
+    ablation.add_argument(
+        "--use_spatial_encoding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Fourier spatial encoding in HyperFlowNet.",
+    )
+    ablation.add_argument(
+        "--use_time_encoding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use sinusoidal rollout-time encoding in HyperFlowNet.",
+    )
+    ablation.add_argument(
         "--use_bc",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Use hard wall boundary condition.",
     )
+    ablation.add_argument(
+        "--use_noise",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Inject rollout noise during training.",
+    )
+    ablation.add_argument(
+        "--use_rollout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use multi-step curriculum rollout during training.",
+    )
+
+    # ============================================================
+    # 5. Boundary Condition
+    # ============================================================
+
+    boundary = parser.add_argument_group("Boundary Condition")
     boundary.add_argument(
         "--bc_threshold",
         type=float,
@@ -167,7 +203,7 @@ def get_args() -> argparse.Namespace:
     )
 
     # ============================================================
-    # 5. Trainer
+    # 6. Trainer
     # ============================================================
 
     trainer = parser.add_argument_group("Trainer")
@@ -188,7 +224,7 @@ def get_args() -> argparse.Namespace:
     )
 
     # ============================================================
-    # 6. Curriculum
+    # 7. Curriculum
     # ============================================================
 
     curriculum = parser.add_argument_group("Curriculum")
@@ -210,4 +246,17 @@ def get_args() -> argparse.Namespace:
     args.geofno_grid_size = _expand_spatial_list(args.geofno_grid_size, args.spatial_dim)
     args.gino_modes = _expand_spatial_list(args.gino_modes, args.spatial_dim)
     args.gino_grid_size = _expand_spatial_list(args.gino_grid_size, args.spatial_dim)
+
+    if not args.use_graph:
+        args.graph_mode = "none"
+    if not args.use_spatial_encoding:
+        args.coord_features = 0
+    if not args.use_time_encoding:
+        args.time_features = 0
+    if not args.use_noise:
+        args.noise_std_init = 0.0
+        args.noise_decay = 0.0
+    if not args.use_rollout:
+        args.max_rollout_steps = 1
+
     return args

@@ -284,6 +284,62 @@ class GraphAssignAttention(nn.Module):
         return torch.bmm(weights, slices_out)
 
 
+class SliceAttention(nn.Module):
+    """
+    Slice attention without graph injection.
+    """
+
+    def __init__(self, width: int, num_slices: int, num_heads: int) -> None:
+        """
+        Initialize plain slice attention.
+
+        Args:
+            width (int): Node token width.
+            num_slices (int): Number of slice tokens.
+            num_heads (int): Number of slice-space attention heads.
+        """
+        super().__init__()
+        if width % num_heads != 0:
+            raise ValueError("width must be divisible by num_heads")
+
+        self.num_heads = num_heads
+        self.head_dim = width // num_heads
+        self.slice_proj = nn.Linear(width, num_slices)
+        self.q_proj = nn.Linear(width, width)
+        self.k_proj = nn.Linear(width, width)
+        self.v_proj = nn.Linear(width, width)
+        self.out_proj = nn.Linear(width, width)
+
+    def forward(self, x: Tensor, adj_indices: Tensor, adj_values: Tensor) -> Tensor:
+        """
+        Apply slice attention without using graph inputs.
+
+        Args:
+            x (Tensor): Node tokens. (B, N, C).
+            adj_indices (Tensor): Unused sparse adjacency indices. (2, E).
+            adj_values (Tensor): Unused sparse adjacency values. (E,).
+
+        Returns:
+            Tensor: Node update. (B, N, C).
+        """
+        B, _, C = x.shape
+        H, D = self.num_heads, self.head_dim
+
+        weights = F.softmax(self.slice_proj(x), dim=-1)
+        weight_sum = weights.sum(dim=1, keepdim=True).transpose(1, 2).clamp_min(1e-8)
+        slices = torch.bmm(weights.transpose(1, 2), x) / weight_sum
+
+        q = self.q_proj(slices).view(B, -1, H, D).transpose(1, 2)
+        k = self.k_proj(slices).view(B, -1, H, D).transpose(1, 2)
+        v = self.v_proj(slices).view(B, -1, H, D).transpose(1, 2)
+        logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)
+        attn = torch.softmax(logits, dim=-1)
+
+        slices_out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, -1, C)
+        slices_out = self.out_proj(slices_out)
+        return torch.bmm(weights, slices_out)
+
+
 class GraphFlowBlock(nn.Module):
     """
     One residual HyperFlowNet block with graph-injected slice attention.
@@ -326,8 +382,14 @@ class GraphFlowBlock(nn.Module):
                 num_slices=num_slices,
                 num_heads=num_heads,
             )
+        elif graph_mode == "none":
+            self.graph_attn = SliceAttention(
+                width=width,
+                num_slices=num_slices,
+                num_heads=num_heads,
+            )
         else:
-            raise ValueError("graph_mode must be bias or assign")
+            raise ValueError("graph_mode must be bias, assign, or none")
 
         self.norm1 = nn.LayerNorm(width)
         self.norm2 = nn.LayerNorm(width)
