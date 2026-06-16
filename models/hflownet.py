@@ -1,4 +1,4 @@
-# HyperFlowNet graph attention operators for flow prediction
+# Annealed sliding-history HyperFlowNet for flow prediction
 # Author: Shengning Wang
 
 import math
@@ -8,83 +8,6 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from tqdm.auto import tqdm
-
-torch.sparse.check_sparse_tensor_invariants.disable()
-
-
-def build_local_graph(coords: Tensor, k: int, sigma_scale: float = 1.5) -> Tuple[Tensor, Tensor, Tensor]:
-    """
-    Build one fixed row-normalized local graph from normalized mesh coordinates.
-
-    Args:
-        coords (Tensor): Node coordinates. (N, D).
-        k (int): Number of nearest neighbors.
-        sigma_scale (float): Distance scale multiplier.
-
-    Returns:
-        Tuple[Tensor, Tensor, Tensor]:
-            Sparse adjacency indices. (2, E_ADJ).
-            Sparse adjacency values. (E_ADJ,).
-            Undirected edge list. (2, E_EDGE).
-    """
-    N = coords.shape[0]
-    dist = torch.cdist(coords, coords)
-    dist.fill_diagonal_(float("inf"))
-
-    knn = torch.topk(dist, k=k, largest=False).indices
-    src = torch.arange(N, device=coords.device).unsqueeze(1).expand(N, k).reshape(-1)
-    dst = knn.reshape(-1)
-
-    graph_src = torch.cat([src, dst], dim=0)
-    graph_dst = torch.cat([dst, src], dim=0)
-    pairs = torch.stack([graph_src, graph_dst], dim=1).tolist()
-    unique_pairs = []
-    seen = set()
-    for src_idx, dst_idx in pairs:
-        pair = (src_idx, dst_idx)
-        if pair not in seen:
-            seen.add(pair)
-            unique_pairs.append(pair)
-
-    graph_edges = torch.tensor(unique_pairs, device=coords.device, dtype=torch.long)
-    graph_src = graph_edges[:, 0]
-    graph_dst = graph_edges[:, 1]
-    graph_dist = torch.norm(coords[graph_dst] - coords[graph_src], dim=-1)
-
-    sigma = (graph_dist.median() * sigma_scale).clamp_min(1e-6)
-    graph_weight = torch.exp(-graph_dist / sigma)
-
-    self_idx = torch.arange(N, device=coords.device)
-    all_src = torch.cat([graph_src, self_idx], dim=0)
-    all_dst = torch.cat([graph_dst, self_idx], dim=0)
-    all_weight = torch.cat([graph_weight, torch.ones(N, device=coords.device, dtype=graph_weight.dtype)], dim=0)
-
-    degree = torch.zeros(N, device=coords.device, dtype=all_weight.dtype)
-    degree.index_add_(0, all_src, all_weight)
-    adj_values = all_weight / degree[all_src].clamp_min(1e-8)
-    adj_indices = torch.stack([all_src, all_dst], dim=0)
-
-    edge_index = torch.stack([graph_src, graph_dst], dim=0)
-    edge_index = edge_index[:, graph_src < graph_dst].contiguous()
-    return adj_indices.long(), adj_values.float(), edge_index.long()
-
-
-def sparse_graph_aggregate(adj_indices: Tensor, adj_values: Tensor, x: Tensor) -> Tensor:
-    """
-    Apply a fixed sparse local graph operator to node features.
-
-    Args:
-        adj_indices (Tensor): Sparse adjacency indices. (2, E).
-        adj_values (Tensor): Sparse adjacency values. (E,).
-        x (Tensor): Node features. (B, N, C).
-
-    Returns:
-        Tensor: Locally aggregated node features. (B, N, C).
-    """
-    B, N, _ = x.shape
-    adj = torch.sparse_coo_tensor(adj_indices, adj_values.float(), size=(N, N), device=x.device).coalesce()
-    y = [torch.sparse.mm(adj, x[b].float()) for b in range(B)]
-    return torch.stack(y, dim=0).to(dtype=x.dtype)
 
 
 # ============================================================
@@ -146,252 +69,230 @@ class TemporalEncoder(nn.Module):
         Encode normalized time and broadcast it to all nodes.
 
         Args:
-            t_norm (Tensor): Normalized frame times. (B,).
+            t_norm (Tensor): Normalized frame times. (B, L).
             num_nodes (int): Number of mesh nodes.
 
         Returns:
-            Tensor: Temporal embedding. (B, N, 2 * C_TIME).
+            Tensor: Temporal embedding. (B, L, N, 2 * C_TIME).
         """
         t_scaled = t_norm.float() * self.freq_base
-        angles = self.omega.unsqueeze(0) * t_scaled.unsqueeze(1)
+        angles = t_scaled.unsqueeze(-1) * self.omega.view(1, 1, -1)
         emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-        return emb.unsqueeze(1).expand(-1, num_nodes, -1)
+        return emb.unsqueeze(2).expand(-1, -1, num_nodes, -1)
 
 
-# ============================================================
-# Graph Attention Blocks
-# ============================================================
-
-
-class GraphBiasAttention(nn.Module):
+class LagEncoder(nn.Module):
     """
-    Slice attention with graph structure injected into attention logits.
+    Sinusoidal encoder for relative history lag indices.
+    """
+
+    def __init__(self, lag_features: int = 4, freq_base: int = 1000) -> None:
+        """
+        Initialize the lag encoder.
+
+        Args:
+            lag_features (int): Half-dimension of the lag embedding.
+            freq_base (int): Base for exponentially decaying frequencies.
+        """
+        super().__init__()
+        indices = torch.arange(lag_features, dtype=torch.float32)
+        omega = freq_base ** (-indices / max(lag_features, 1))
+        self.register_buffer("omega", omega, persistent=False)
+
+    def forward(self, lags: Tensor, batch_size: int, num_nodes: int) -> Tensor:
+        """
+        Encode lag indices and broadcast them to all nodes.
+
+        Args:
+            lags (Tensor): Lag indices. (L,).
+            batch_size (int): Batch size.
+            num_nodes (int): Number of mesh nodes.
+
+        Returns:
+            Tensor: Lag embedding. (B, L, N, 2 * C_LAG).
+        """
+        angles = lags.float().unsqueeze(-1) * self.omega.view(1, -1)
+        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+        return emb.view(1, -1, 1, emb.shape[-1]).expand(batch_size, -1, num_nodes, -1)
+
+
+# ============================================================
+# Sliding-History Kernel Blocks
+# ============================================================
+
+
+class HistoryAttention(nn.Module):
+    """
+    History-aware slice attention with annealed lag bias, spatial bias, and token gates.
     """
 
     def __init__(
         self,
         width: int,
+        spatial_dim: int,
         num_slices: int,
         num_heads: int,
-        graph_beta_init: float = 0.13,
-        graph_bias_eps: float = 1e-6,
+        use_bias: bool = True,
+        use_gating: bool = True,
+        bias_beta_init: float = 1.0,
+        gate_beta_init: float = 1.0,
+        space_tau_init: float = 1.0,
+        eps: float = 1e-6,
     ) -> None:
         """
-        Initialize graph-biased slice attention.
+        Initialize history attention.
 
         Args:
             width (int): Node token width.
-            num_slices (int): Number of slice tokens.
-            num_heads (int): Number of slice-space attention heads.
-            graph_beta_init (float): Initial graph bias strength.
-            graph_bias_eps (float): Small bias stabilizer.
+            spatial_dim (int): Spatial coordinate dimension.
+            num_slices (int): Number of slice tokens per frame.
+            num_heads (int): Number of attention heads.
+            use_bias (bool): Whether to add joint spatial-history log bias.
+            use_gating (bool): Whether to apply slice token gating.
+            bias_beta_init (float): Initial structural bias strength.
+            gate_beta_init (float): Initial gate-logit strength.
+            space_tau_init (float): Initial spatial Gaussian bandwidth.
+            eps (float): Small stabilizer.
         """
         super().__init__()
         if width % num_heads != 0:
             raise ValueError("width must be divisible by num_heads")
 
+        self.spatial_dim = spatial_dim
+        self.num_slices = num_slices
         self.num_heads = num_heads
         self.head_dim = width // num_heads
-        self.graph_bias_eps = graph_bias_eps
+        self.use_bias = use_bias
+        self.use_gating = use_gating
+        self.eps = eps
 
         self.slice_proj = nn.Linear(width, num_slices)
         self.q_proj = nn.Linear(width, width)
         self.k_proj = nn.Linear(width, width)
         self.v_proj = nn.Linear(width, width)
         self.out_proj = nn.Linear(width, width)
-        self.beta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(graph_beta_init)), dtype=torch.float32))
 
-    def forward(self, x: Tensor, adj_indices: Tensor, adj_values: Tensor) -> Tensor:
+        self.bias_beta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(bias_beta_init)), dtype=torch.float32))
+        self.gate_beta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(gate_beta_init)), dtype=torch.float32))
+        self.space_tau_raw = nn.Parameter(torch.tensor(math.log(math.expm1(space_tau_init)), dtype=torch.float32))
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(width + 2, width),
+            nn.GELU(),
+            nn.Linear(width, 1),
+        )
+
+    def _slice_tokens(self, x: Tensor, coords: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        weights = F.softmax(self.slice_proj(x), dim=-1)
+        pop = weights.sum(dim=2)
+        denom = pop.clamp_min(self.eps).unsqueeze(-1)
+        slices = torch.einsum("blng,blnc->blgc", weights, x) / denom
+
+        coords = coords.unsqueeze(1).expand(-1, x.shape[1], -1, -1)
+        centers = torch.einsum("blng,blnd->blgd", weights, coords) / denom
+        return weights, slices, centers, pop
+
+    def _joint_log_bias(self, centers: Tensor, history_weights: Tensor) -> Tensor:
+        center_current = centers[:, 0]
+        delta = center_current[:, :, None, None, :] - centers[:, None, :, :, :]
+        dist2 = delta.square().sum(dim=-1)
+        tau2 = F.softplus(self.space_tau_raw).square().clamp_min(self.eps)
+        space_bias = -dist2 / tau2
+
+        history_bias = torch.log(history_weights.clamp_min(self.eps)).view(history_weights.shape[0], 1, -1, 1)
+        bias = space_bias + history_bias
+        bias = bias.reshape(centers.shape[0], self.num_slices, -1)
+        return bias - torch.logsumexp(bias, dim=-1, keepdim=True)
+
+    def forward(self, x: Tensor, coords: Tensor, history_weights: Tensor) -> Tensor:
         """
-        Apply graph-biased slice attention.
+        Apply current-to-history slice attention.
 
         Args:
-            x (Tensor): Node tokens. (B, N, C).
-            adj_indices (Tensor): Sparse adjacency indices. (2, E).
-            adj_values (Tensor): Sparse adjacency values. (E,).
+            x (Tensor): History node tokens. (B, L, N, C).
+            coords (Tensor): Node coordinates. (B, N, D).
+            history_weights (Tensor): Normalized lag weights. (B, L).
 
         Returns:
-            Tensor: Node update. (B, N, C).
+            Tensor: Current-frame node update. (B, N, C).
         """
-        B, _, C = x.shape
+        B, L, N, C = x.shape
         H, D = self.num_heads, self.head_dim
 
-        weights = F.softmax(self.slice_proj(x), dim=-1)
-        weight_sum = weights.sum(dim=1, keepdim=True).transpose(1, 2).clamp_min(self.graph_bias_eps)
-        slices = torch.bmm(weights.transpose(1, 2), x) / weight_sum
+        weights, slices, centers, pop = self._slice_tokens(x, coords)
+        query = self.q_proj(slices[:, 0]).view(B, self.num_slices, H, D).transpose(1, 2)
+        key = self.k_proj(slices).view(B, L * self.num_slices, H, D).transpose(1, 2)
+        value = self.v_proj(slices).view(B, L * self.num_slices, C)
 
-        graph_weights = sparse_graph_aggregate(adj_indices, adj_values, weights)
+        if self.use_gating:
+            pop_log = torch.log(pop.clamp_min(self.eps)).unsqueeze(-1)
+            pi = history_weights[:, :, None, None].expand(-1, -1, self.num_slices, 1)
+            gate = 2.0 * torch.sigmoid(self.gate_mlp(torch.cat([slices, pop_log, pi], dim=-1)))
+            gate_flat = gate.reshape(B, L * self.num_slices, 1)
+            value = value * gate_flat
 
-        graph_bias = torch.bmm(weights.transpose(1, 2), graph_weights)
-        graph_bias = 0.5 * (graph_bias + graph_bias.transpose(1, 2))
-        graph_bias = graph_bias / graph_bias.sum(dim=-1, keepdim=True).clamp_min(self.graph_bias_eps)
-        graph_bias = torch.log(graph_bias.clamp_min(self.graph_bias_eps))
+        value = value.view(B, L * self.num_slices, H, D).transpose(1, 2)
+        logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(D)
 
-        q = self.q_proj(slices).view(B, -1, H, D).transpose(1, 2)
-        k = self.k_proj(slices).view(B, -1, H, D).transpose(1, 2)
-        v = self.v_proj(slices).view(B, -1, H, D).transpose(1, 2)
-        logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)
-        logits = logits + F.softplus(self.beta_raw) * graph_bias.unsqueeze(1)
+        if self.use_bias:
+            bias = self._joint_log_bias(centers, history_weights)
+            logits = logits + F.softplus(self.bias_beta_raw) * bias.unsqueeze(1)
+
+        if self.use_gating:
+            gate_bias = torch.log(gate_flat.squeeze(-1).clamp_min(self.eps))
+            logits = logits + F.softplus(self.gate_beta_raw) * gate_bias[:, None, None, :]
 
         attn = torch.softmax(logits, dim=-1)
-        slices_out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, -1, C)
-        slices_out = self.out_proj(slices_out)
-        return torch.bmm(weights, slices_out)
+        out_slices = torch.matmul(attn, value).transpose(1, 2).contiguous().view(B, self.num_slices, C)
+        out_slices = self.out_proj(out_slices)
+        return torch.bmm(weights[:, 0], out_slices)
 
 
-class GraphAssignAttention(nn.Module):
+class HyperFlowBlock(nn.Module):
     """
-    Slice attention with graph structure injected into node-to-slice assignment.
-    """
-
-    def __init__(self, width: int, num_slices: int, num_heads: int) -> None:
-        """
-        Initialize graph-aware assignment attention.
-
-        Args:
-            width (int): Node token width.
-            num_slices (int): Number of slice tokens.
-            num_heads (int): Number of slice-space attention heads.
-        """
-        super().__init__()
-        self.assign_self = nn.Linear(width, width)
-        self.assign_graph = nn.Linear(width, width, bias=False)
-        self.assign_norm = nn.LayerNorm(width)
-        self.slice_proj = nn.Linear(width, num_slices)
-        self.attn = nn.MultiheadAttention(embed_dim=width, num_heads=num_heads, batch_first=True)
-
-    def forward(self, x: Tensor, adj_indices: Tensor, adj_values: Tensor) -> Tensor:
-        """
-        Apply graph-aware assignment attention.
-
-        Args:
-            x (Tensor): Node tokens. (B, N, C).
-            adj_indices (Tensor): Sparse adjacency indices. (2, E).
-            adj_values (Tensor): Sparse adjacency values. (E,).
-
-        Returns:
-            Tensor: Node update. (B, N, C).
-        """
-        x_graph = sparse_graph_aggregate(adj_indices, adj_values, x)
-        assign_input = self.assign_self(x) + self.assign_graph(x_graph)
-
-        assign = F.gelu(self.assign_norm(assign_input))
-        weights = F.softmax(self.slice_proj(assign), dim=-1)
-
-        weight_sum = weights.sum(dim=1, keepdim=True).transpose(1, 2).clamp_min(1e-8)
-        slices = torch.bmm(weights.transpose(1, 2), x) / weight_sum
-        slices_out, _ = self.attn(slices, slices, slices, need_weights=False)
-        return torch.bmm(weights, slices_out)
-
-
-class SliceAttention(nn.Module):
-    """
-    Slice attention without graph injection.
-    """
-
-    def __init__(self, width: int, num_slices: int, num_heads: int) -> None:
-        """
-        Initialize plain slice attention.
-
-        Args:
-            width (int): Node token width.
-            num_slices (int): Number of slice tokens.
-            num_heads (int): Number of slice-space attention heads.
-        """
-        super().__init__()
-        if width % num_heads != 0:
-            raise ValueError("width must be divisible by num_heads")
-
-        self.num_heads = num_heads
-        self.head_dim = width // num_heads
-        self.slice_proj = nn.Linear(width, num_slices)
-        self.q_proj = nn.Linear(width, width)
-        self.k_proj = nn.Linear(width, width)
-        self.v_proj = nn.Linear(width, width)
-        self.out_proj = nn.Linear(width, width)
-
-    def forward(self, x: Tensor, adj_indices: Tensor, adj_values: Tensor) -> Tensor:
-        """
-        Apply slice attention without using graph inputs.
-
-        Args:
-            x (Tensor): Node tokens. (B, N, C).
-            adj_indices (Tensor): Unused sparse adjacency indices. (2, E).
-            adj_values (Tensor): Unused sparse adjacency values. (E,).
-
-        Returns:
-            Tensor: Node update. (B, N, C).
-        """
-        B, _, C = x.shape
-        H, D = self.num_heads, self.head_dim
-
-        weights = F.softmax(self.slice_proj(x), dim=-1)
-        weight_sum = weights.sum(dim=1, keepdim=True).transpose(1, 2).clamp_min(1e-8)
-        slices = torch.bmm(weights.transpose(1, 2), x) / weight_sum
-
-        q = self.q_proj(slices).view(B, -1, H, D).transpose(1, 2)
-        k = self.k_proj(slices).view(B, -1, H, D).transpose(1, 2)
-        v = self.v_proj(slices).view(B, -1, H, D).transpose(1, 2)
-        logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)
-        attn = torch.softmax(logits, dim=-1)
-
-        slices_out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, -1, C)
-        slices_out = self.out_proj(slices_out)
-        return torch.bmm(weights, slices_out)
-
-
-class GraphFlowBlock(nn.Module):
-    """
-    One residual HyperFlowNet block with graph-injected slice attention.
+    One pre-norm sliding-history HyperFlowNet block.
     """
 
     def __init__(
         self,
-        graph_mode: str,
         width: int,
+        spatial_dim: int,
         num_slices: int,
         num_heads: int,
         ffn_dim: int,
-        graph_beta_init: float,
-        graph_bias_eps: float,
+        use_bias: bool,
+        use_gating: bool,
+        bias_beta_init: float,
+        gate_beta_init: float,
+        space_tau_init: float,
     ) -> None:
         """
-        Initialize one graph attention block.
+        Initialize one HyperFlowNet block.
 
         Args:
-            graph_mode (str): Graph injection mode.
             width (int): Node token width.
+            spatial_dim (int): Spatial coordinate dimension.
             num_slices (int): Number of slice tokens.
             num_heads (int): Number of attention heads.
             ffn_dim (int): Hidden width of the feed-forward block.
-            graph_beta_init (float): Initial graph bias strength.
-            graph_bias_eps (float): Small graph bias stabilizer.
+            use_bias (bool): Whether to use joint log bias.
+            use_gating (bool): Whether to use slice token gating.
+            bias_beta_init (float): Initial structural bias strength.
+            gate_beta_init (float): Initial gate-logit strength.
+            space_tau_init (float): Initial spatial Gaussian bandwidth.
         """
         super().__init__()
-        if graph_mode == "bias":
-            self.graph_attn = GraphBiasAttention(
-                width=width,
-                num_slices=num_slices,
-                num_heads=num_heads,
-                graph_beta_init=graph_beta_init,
-                graph_bias_eps=graph_bias_eps,
-            )
-        elif graph_mode == "assign":
-            self.graph_attn = GraphAssignAttention(
-                width=width,
-                num_slices=num_slices,
-                num_heads=num_heads,
-            )
-        elif graph_mode == "none":
-            self.graph_attn = SliceAttention(
-                width=width,
-                num_slices=num_slices,
-                num_heads=num_heads,
-            )
-        else:
-            raise ValueError("graph_mode must be bias, assign, or none")
-
         self.norm1 = nn.LayerNorm(width)
+        self.history_attn = HistoryAttention(
+            width=width,
+            spatial_dim=spatial_dim,
+            num_slices=num_slices,
+            num_heads=num_heads,
+            use_bias=use_bias,
+            use_gating=use_gating,
+            bias_beta_init=bias_beta_init,
+            gate_beta_init=gate_beta_init,
+            space_tau_init=space_tau_init,
+        )
         self.norm2 = nn.LayerNorm(width)
         self.ffn = nn.Sequential(
             nn.Linear(width, ffn_dim),
@@ -399,21 +300,21 @@ class GraphFlowBlock(nn.Module):
             nn.Linear(ffn_dim, width),
         )
 
-    def forward(self, x: Tensor, adj_indices: Tensor, adj_values: Tensor) -> Tensor:
+    def forward(self, history: Tensor, coords: Tensor, history_weights: Tensor) -> Tensor:
         """
-        Apply one residual graph attention update.
+        Apply one residual current-frame update.
 
         Args:
-            x (Tensor): Node tokens. (B, N, C).
-            adj_indices (Tensor): Sparse adjacency indices. (2, E).
-            adj_values (Tensor): Sparse adjacency values. (E,).
+            history (Tensor): History node tokens. (B, L, N, C).
+            coords (Tensor): Node coordinates. (B, N, D).
+            history_weights (Tensor): Normalized lag weights. (B, L).
 
         Returns:
-            Tensor: Updated node tokens. (B, N, C).
+            Tensor: Updated history tokens. (B, L, N, C).
         """
-        x = x + self.graph_attn(self.norm1(x), adj_indices, adj_values)
-        x = x + self.ffn(self.norm2(x))
-        return x
+        current = history[:, 0] + self.history_attn(self.norm1(history), coords, history_weights)
+        current = current + self.ffn(self.norm2(current))
+        return torch.cat([current.unsqueeze(1), history[:, 1:]], dim=1)
 
 
 # ============================================================
@@ -423,28 +324,32 @@ class GraphFlowBlock(nn.Module):
 
 class HyperFlowNet(nn.Module):
     """
-    HyperFlowNet graph-injection comparison model for flow prediction.
+    Annealed sliding-history kernel operator for flow prediction on fixed meshes.
     """
+
+    uses_history = True
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
         spatial_dim: int,
-        adj_indices: Tensor,
-        adj_values: Tensor,
-        edge_index: Tensor,
-        graph_mode: str = "bias",
         width: int = 128,
         depth: int = 4,
         num_slices: int = 32,
         num_heads: int = 8,
         ffn_dim: Optional[int] = None,
+        use_spatial_encoding: bool = True,
+        use_time_encoding: bool = True,
+        use_bias: bool = True,
+        use_gating: bool = True,
         coord_features: int = 8,
         time_features: int = 4,
+        lag_features: int = 4,
         freq_base: int = 1000,
-        graph_beta_init: float = 0.13,
-        graph_bias_eps: float = 1e-6,
+        bias_beta_init: float = 1.0,
+        gate_beta_init: float = 1.0,
+        space_tau_init: float = 1.0,
     ) -> None:
         """
         Initialize HyperFlowNet.
@@ -453,78 +358,130 @@ class HyperFlowNet(nn.Module):
             in_channels (int): Number of node input channels.
             out_channels (int): Number of node output channels.
             spatial_dim (int): Spatial coordinate dimension.
-            adj_indices (Tensor): Sparse adjacency indices. (2, E).
-            adj_values (Tensor): Sparse adjacency values. (E,).
-            edge_index (Tensor): Undirected local edge list. (2, E_EDGE).
-            graph_mode (str): Graph injection mode.
             width (int): Hidden channel width.
             depth (int): Number of HyperFlowNet blocks.
             num_slices (int): Number of slice tokens.
             num_heads (int): Number of slice-space attention heads.
             ffn_dim (Optional[int]): Hidden width of the feed-forward block.
+            use_spatial_encoding (bool): Whether to use Fourier spatial encoding.
+            use_time_encoding (bool): Whether to use absolute time and lag encodings.
+            use_bias (bool): Whether to use joint spatial-history log bias.
+            use_gating (bool): Whether to use slice token gating.
             coord_features (int): Half-dimension of the Fourier spatial encoding.
             time_features (int): Half-dimension of the temporal encoding.
+            lag_features (int): Half-dimension of the relative lag encoding.
             freq_base (int): Base for temporal frequencies.
-            graph_beta_init (float): Initial graph bias strength.
-            graph_bias_eps (float): Small graph bias stabilizer.
+            bias_beta_init (float): Initial structural bias strength.
+            gate_beta_init (float): Initial gate-logit strength.
+            space_tau_init (float): Initial spatial Gaussian bandwidth.
         """
         super().__init__()
         if ffn_dim is None:
             ffn_dim = 4 * width
 
-        self.graph_mode = graph_mode
-        self.register_buffer("adj_indices", adj_indices.long(), persistent=False)
-        self.register_buffer("adj_values", adj_values.float(), persistent=False)
-        self.register_buffer("edge_index", edge_index.long(), persistent=False)
+        self.use_spatial_encoding = use_spatial_encoding and coord_features > 0
+        self.use_time_encoding = use_time_encoding and time_features > 0
+        self.use_lag_encoding = use_time_encoding and lag_features > 0
 
-        self.spatial_encoder = SpatialEncoder(spatial_dim=spatial_dim, coord_features=coord_features)
-        self.time_encoder = TemporalEncoder(time_features=time_features, freq_base=freq_base)
-        coord_dim = 2 * coord_features
-        time_dim = 2 * time_features
+        if self.use_spatial_encoding:
+            self.spatial_encoder = SpatialEncoder(spatial_dim=spatial_dim, coord_features=coord_features)
+            coord_dim = 2 * coord_features
+        else:
+            self.spatial_encoder = None
+            coord_dim = 0
 
-        self.embed = nn.Linear(in_channels + coord_dim + time_dim, width)
+        if self.use_time_encoding:
+            self.time_encoder = TemporalEncoder(time_features=time_features, freq_base=freq_base)
+            time_dim = 2 * time_features
+        else:
+            self.time_encoder = None
+            time_dim = 0
+
+        if self.use_lag_encoding:
+            self.lag_encoder = LagEncoder(lag_features=lag_features, freq_base=freq_base)
+            lag_dim = 2 * lag_features
+        else:
+            self.lag_encoder = None
+            lag_dim = 0
+
+        self.embed = nn.Linear(in_channels + coord_dim + time_dim + lag_dim, width)
         self.blocks = nn.ModuleList([
-            GraphFlowBlock(
-                graph_mode=graph_mode,
+            HyperFlowBlock(
                 width=width,
+                spatial_dim=spatial_dim,
                 num_slices=num_slices,
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
-                graph_beta_init=graph_beta_init,
-                graph_bias_eps=graph_bias_eps,
+                use_bias=use_bias,
+                use_gating=use_gating,
+                bias_beta_init=bias_beta_init,
+                gate_beta_init=gate_beta_init,
+                space_tau_init=space_tau_init,
             )
             for _ in range(depth)
         ])
         self.proj = nn.Linear(width, out_channels)
 
-    def forward(self, inputs: Tensor, coords: Tensor, t_norm: Optional[Tensor] = None) -> Tensor:
+    def _prepare_t_norm(self, t_norm: Optional[Tensor], batch_size: int, history_len: int, coords: Tensor) -> Tensor:
+        if t_norm is None:
+            return torch.zeros(batch_size, history_len, device=coords.device, dtype=coords.dtype)
+        t_norm = t_norm.to(device=coords.device, dtype=coords.dtype)
+        if t_norm.dim() == 1:
+            t_norm = t_norm[:, None].expand(-1, history_len)
+        return t_norm
+
+    def _prepare_history_weights(self, history_weights: Optional[Tensor], batch_size: int, history_len: int, x: Tensor) -> Tensor:
+        if history_weights is None:
+            weights = x.new_ones(batch_size, history_len)
+        else:
+            weights = history_weights.to(device=x.device, dtype=x.dtype)
+            if weights.dim() == 1:
+                weights = weights.unsqueeze(0).expand(batch_size, -1)
+        return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    def forward(
+        self,
+        inputs: Tensor,
+        coords: Tensor,
+        t_norm: Optional[Tensor] = None,
+        history_weights: Optional[Tensor] = None,
+    ) -> Tensor:
         """
         Predict the next state on the mesh.
 
         Args:
-            inputs (Tensor): Current node features. (B, N, C_IN).
+            inputs (Tensor): History or current node features. (B, L, N, C_IN) or (B, N, C_IN).
             coords (Tensor): Node coordinates. (B, N, D).
-            t_norm (Optional[Tensor]): Normalized rollout time. (B,).
+            t_norm (Optional[Tensor]): Normalized history frame times. (B, L) or (B,).
+            history_weights (Optional[Tensor]): Normalized lag weights. (L,) or (B, L).
 
         Returns:
             Tensor: Predicted next state. (B, N, C_OUT).
         """
-        B, N, _ = coords.shape
-        if t_norm is None:
-            t_norm = torch.zeros(B, device=coords.device, dtype=coords.dtype)
-        else:
-            t_norm = t_norm.to(device=coords.device, dtype=coords.dtype)
+        if inputs.dim() == 3:
+            inputs = inputs.unsqueeze(1)
 
-        x = torch.cat([
-            inputs,
-            self.spatial_encoder(coords),
-            self.time_encoder(t_norm, N).to(dtype=coords.dtype),
-        ], dim=-1)
+        B, L, N, _ = inputs.shape
+        components = [inputs]
 
-        x = self.embed(x)
+        if self.spatial_encoder is not None:
+            spatial = self.spatial_encoder(coords).unsqueeze(1).expand(-1, L, -1, -1)
+            components.append(spatial)
+
+        if self.time_encoder is not None:
+            times = self._prepare_t_norm(t_norm, B, L, coords)
+            components.append(self.time_encoder(times, N).to(dtype=inputs.dtype))
+
+        if self.lag_encoder is not None:
+            lags = torch.arange(L, device=inputs.device, dtype=inputs.dtype)
+            components.append(self.lag_encoder(lags, B, N).to(dtype=inputs.dtype))
+
+        x = self.embed(torch.cat(components, dim=-1))
+        weights = self._prepare_history_weights(history_weights, B, L, x)
+
         for block in self.blocks:
-            x = block(x, self.adj_indices, self.adj_values)
-        return self.proj(x)
+            x = block(x, coords, weights)
+        return self.proj(x[:, 0])
 
     def predict(self, inputs: Tensor, coords: Tensor, steps: int, bc: Optional[object] = None) -> Tensor:
         """

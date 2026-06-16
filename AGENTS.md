@@ -13,5 +13,5 @@ The current active code path is:
 The most important structural rule is:
 
 - Treat `training/base_trainer.py` and `utils/*` as mature WSNet-style shared infrastructure.
-- Treat `main.py`, `config.py`, `data/*`, `training/hflow_trainer.py`, and `models/hflownet.py` as HyperFlowNet-local task code.
+- Treat `main.py`, `config.yaml`, `data/*`, `training/hflow_trainer.py`, and `models/hflownet.py` as HyperFlowNet-local task code.
 - Treat `models/hflownet.py` as the local fast-iteration area: model ideas can be developed in HyperFlowNet first, then synced back to WSNet once validated.

@@ -1,9 +1,11 @@
 # Main script for HyperFlowNet flow simulation workflows
 # Author: Shengning Wang
 
+import argparse
+import ast
 import json
 import time
-from datetime import datetime, timedelta
+from argparse import Namespace
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -11,19 +13,16 @@ import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
-import config
 from data.boundary import BoundaryCondition
 from data.flow_data import FlowData
 from data.flow_metrics import Metrics
-from data.flow_vis import FlowVis
 from data.flow_twin import FlowTwin
+from data.flow_vis import FlowVis
 from data.initial_state import initial_state_from_label
 from models.gcn import GCN
 from models.geofno import GeoFNO
 from models.gino import GINO
-from models.gnot import GNOT
-from models.hflownet import HyperFlowNet, build_local_graph
-from models.meshgraphnet import MeshGraphNet
+from models.hflownet import HyperFlowNet
 from models.transolver import Transolver
 from training.hflow_trainer import HyperFlowTrainer
 from utils.hue_logger import hue, logger
@@ -31,12 +30,219 @@ from utils.scaler import MinMaxScalerTensor, StandardScalerTensor
 from utils.seeder import seed_everything
 
 
+CONFIG_PATH = Path(__file__).with_name("config.yaml")
+MODEL_NAMES = {"hflownet", "transolver", "geofno", "gcn", "gino"}
+ABLATIONS = {"none", "time_encoding", "spatial_encoding", "noise", "rollout", "bc", "bias", "gating", "loss"}
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+
+def _strip_comment(line: str) -> str:
+    quote = None
+    for idx, char in enumerate(line):
+        if char in {"'", '"'}:
+            quote = None if quote == char else char
+        if char == "#" and quote is None:
+            return line[:idx]
+    return line
+
+
+def _parse_config_value(raw: str) -> Any:
+    raw = raw.strip()
+    lower = raw.lower()
+    if lower in {"true", "false"}:
+        return lower == "true"
+    if lower in {"null", "none"}:
+        return None
+    if raw.startswith("[") and raw.endswith("]"):
+        return ast.literal_eval(raw)
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        return ast.literal_eval(raw)
+    try:
+        return int(raw)
+    except ValueError:
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+
+
+def _load_config_file(path: Path) -> Dict[str, Any]:
+    root: Dict[str, Any] = {}
+    stack: list[tuple[int, Dict[str, Any]]] = [(-1, root)]
+
+    for line in path.read_text().splitlines():
+        clean = _strip_comment(line).rstrip()
+        if not clean.strip():
+            continue
+        indent = len(clean) - len(clean.lstrip(" "))
+        key, sep, raw_value = clean.strip().partition(":")
+        if sep == "":
+            continue
+
+        while indent <= stack[-1][0]:
+            stack.pop()
+
+        parent = stack[-1][1]
+        if raw_value.strip() == "":
+            child: Dict[str, Any] = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = _parse_config_value(raw_value)
+
+    return root
+
+
+def _flatten_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    flat: Dict[str, Any] = {}
+    for key, value in config.items():
+        if isinstance(value, dict):
+            flat.update(_flatten_config(value))
+        else:
+            flat[key] = value
+    return flat
+
+
+def _set_config_value(config: Dict[str, Any], path: str, value: Any) -> None:
+    keys = path.split(".")
+    current = config
+    for key in keys[:-1]:
+        current = current.setdefault(key, {})
+    current[keys[-1]] = value
+
+
+def _parse_cli() -> tuple[argparse.Namespace, Dict[str, Any]]:
+    parser = argparse.ArgumentParser(
+        description="HyperFlowNet: A Spatio-Temporal Neural Operator for Flow Simulation",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--config", type=str, default=str(CONFIG_PATH), help="Path to a YAML experiment config.")
+    parser.add_argument("--set", action="append", default=[], help="Override a config entry, e.g. model.width=256.")
+    parser.add_argument("--mode", type=str, nargs="+", help="Execution phases to run.")
+    parser.add_argument("--output_dir", type=str, help="Directory to save checkpoints and outputs.")
+    parser.add_argument("--model_name", type=str, choices=sorted(MODEL_NAMES), help="Model architecture.")
+    parser.add_argument("--ablation", type=str, choices=sorted(ABLATIONS), help="Ablation preset.")
+
+    parsed, unknown = parser.parse_known_args()
+    overrides: Dict[str, Any] = {}
+    idx = 0
+    while idx < len(unknown):
+        token = unknown[idx]
+        if token.startswith("--no-"):
+            overrides[token[5:].replace("-", "_")] = False
+            idx += 1
+        elif token.startswith("--"):
+            key = token[2:].replace("-", "_")
+            if idx + 1 < len(unknown) and not unknown[idx + 1].startswith("--"):
+                overrides[key] = _parse_config_value(unknown[idx + 1])
+                idx += 2
+            else:
+                overrides[key] = True
+                idx += 1
+        else:
+            idx += 1
+    return parsed, overrides
+
+
+def _expand_spatial_list(values: list[int], spatial_dim: int) -> list[int]:
+    if len(values) == spatial_dim:
+        return values
+    if len(values) == 1:
+        return values * spatial_dim
+    return values[:spatial_dim]
+
+
+def _apply_ablation(args: Namespace) -> None:
+    if args.ablation == "time_encoding":
+        args.use_time_encoding = False
+    elif args.ablation == "spatial_encoding":
+        args.use_spatial_encoding = False
+    elif args.ablation == "noise":
+        args.use_noise = False
+    elif args.ablation == "rollout":
+        args.use_rollout = False
+    elif args.ablation == "bc":
+        args.use_bc = False
+    elif args.ablation == "bias":
+        args.use_bias = False
+    elif args.ablation == "gating":
+        args.use_gating = False
+    elif args.ablation == "loss":
+        args.use_weighted_loss = False
+
+
+def _finalize_config(args: Namespace) -> Namespace:
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    args.model_name = args.model_name.lower()
+    if args.model_name not in MODEL_NAMES:
+        raise ValueError(f"unknown model_name: {args.model_name}")
+    if args.ablation not in ABLATIONS:
+        raise ValueError(f"unknown ablation: {args.ablation}")
+
+    _apply_ablation(args)
+
+    if not args.use_spatial_encoding:
+        args.coord_features = 0
+    if not args.use_time_encoding:
+        args.time_features = 0
+        args.lag_features = 0
+    if not args.use_noise:
+        args.noise_std_init = 0.0
+        args.noise_decay = 0.0
+    if not args.use_rollout:
+        args.max_rollout_steps = 1
+        args.max_history_steps = 1
+    if not args.use_weighted_loss:
+        args.use_causal_weighting = False
+
+    args.geofno_modes = _expand_spatial_list(args.geofno_modes, args.spatial_dim)
+    args.geofno_grid_size = _expand_spatial_list(args.geofno_grid_size, args.spatial_dim)
+    args.gino_modes = _expand_spatial_list(args.gino_modes, args.spatial_dim)
+    args.gino_grid_size = _expand_spatial_list(args.gino_grid_size, args.spatial_dim)
+    return args
+
+
+def get_args() -> Namespace:
+    """
+    Load YAML config and command-line overrides.
+
+    Returns:
+        Namespace: Resolved experiment arguments.
+    """
+    parsed, unknown_overrides = _parse_cli()
+    config_path = Path(parsed.config)
+    config = _load_config_file(config_path)
+
+    for assignment in parsed.set:
+        key, value = assignment.split("=", 1)
+        _set_config_value(config, key, _parse_config_value(value))
+
+    flat = _flatten_config(config)
+    flat.update(unknown_overrides)
+    for key in ("mode", "output_dir", "model_name", "ablation"):
+        value = getattr(parsed, key)
+        if value is not None:
+            flat[key] = value
+
+    args = Namespace(**flat)
+    args.config = str(config_path)
+    return _finalize_config(args)
+
+
+# ============================================================
+# Builders
+# ============================================================
+
+
 def build_model(
     args: Any | None = None,
     model_args: Dict[str, Any] | None = None,
-    adj_indices: Tensor | None = None,
-    adj_values: Tensor | None = None,
-    edge_index: Tensor | None = None,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Build the configured flow model and return its constructor arguments.
@@ -44,9 +250,6 @@ def build_model(
     Args:
         args (Any | None): Parsed arguments.
         model_args (Dict[str, Any] | None): Explicit model arguments.
-        adj_indices (Tensor | None): Sparse adjacency indices. (2, E).
-        adj_values (Tensor | None): Sparse adjacency values. (E,).
-        edge_index (Tensor | None): Undirected edge list. (2, E_EDGE).
 
     Returns:
         Tuple[nn.Module, Dict[str, Any]]: Model instance and model argument dict.
@@ -60,15 +263,25 @@ def build_model(
             "width": args.width,
             "depth": args.depth,
             "dropout": args.dropout,
-            "graph_mode": args.graph_mode,
             "num_slices": args.num_slices,
             "num_heads": args.num_heads,
             "coord_features": args.coord_features,
             "time_features": args.time_features,
+            "lag_features": args.lag_features,
             "freq_base": args.freq_base,
-            "graph_beta_init": args.graph_beta_init,
-            "graph_bias_eps": args.graph_bias_eps,
-            "num_experts": args.num_experts,
+            "use_spatial_encoding": args.use_spatial_encoding,
+            "use_time_encoding": args.use_time_encoding,
+            "use_bias": args.use_bias,
+            "use_gating": args.use_gating,
+            "bias_beta_init": args.bias_beta_init,
+            "gate_beta_init": args.gate_beta_init,
+            "space_tau_init": args.space_tau_init,
+            "transolver_mlp_ratio": args.transolver_mlp_ratio,
+            "transolver_use_time_input": args.transolver_use_time_input,
+            "transolver_unified_pos": args.transolver_unified_pos,
+            "transolver_ref": args.transolver_ref,
+            "graph_k": args.graph_k,
+            "graph_sigma_scale": args.graph_sigma_scale,
             "geofno_modes": args.geofno_modes,
             "geofno_grid_size": args.geofno_grid_size,
             "gino_modes": args.gino_modes,
@@ -82,19 +295,21 @@ def build_model(
             in_channels=model_args["in_channels"],
             out_channels=model_args["out_channels"],
             spatial_dim=model_args["spatial_dim"],
-            adj_indices=adj_indices,
-            adj_values=adj_values,
-            edge_index=edge_index,
-            graph_mode=model_args["graph_mode"],
             width=model_args["width"],
             depth=model_args["depth"],
             num_slices=model_args["num_slices"],
             num_heads=model_args["num_heads"],
             coord_features=model_args["coord_features"],
             time_features=model_args["time_features"],
+            lag_features=model_args["lag_features"],
             freq_base=model_args["freq_base"],
-            graph_beta_init=model_args["graph_beta_init"],
-            graph_bias_eps=model_args["graph_bias_eps"],
+            use_spatial_encoding=model_args["use_spatial_encoding"],
+            use_time_encoding=model_args["use_time_encoding"],
+            use_bias=model_args["use_bias"],
+            use_gating=model_args["use_gating"],
+            bias_beta_init=model_args["bias_beta_init"],
+            gate_beta_init=model_args["gate_beta_init"],
+            space_tau_init=model_args["space_tau_init"],
         )
     elif model_name == "transolver":
         model = Transolver(
@@ -106,17 +321,10 @@ def build_model(
             num_slices=model_args["num_slices"],
             num_heads=model_args["num_heads"],
             dropout=model_args["dropout"],
-        )
-    elif model_name == "gnot":
-        model = GNOT(
-            in_channels=model_args["in_channels"],
-            out_channels=model_args["out_channels"],
-            spatial_dim=model_args["spatial_dim"],
-            width=model_args["width"],
-            depth=model_args["depth"],
-            num_heads=model_args["num_heads"],
-            num_experts=model_args["num_experts"],
-            dropout=model_args["dropout"],
+            mlp_ratio=model_args["transolver_mlp_ratio"],
+            use_time_input=model_args["transolver_use_time_input"],
+            unified_pos=model_args["transolver_unified_pos"],
+            ref=model_args["transolver_ref"],
         )
     elif model_name == "geofno":
         model = GeoFNO(
@@ -144,20 +352,11 @@ def build_model(
             in_channels=model_args["in_channels"],
             out_channels=model_args["out_channels"],
             spatial_dim=model_args["spatial_dim"],
-            adj_indices=adj_indices,
-            adj_values=adj_values,
+            graph_k=model_args["graph_k"],
+            graph_sigma_scale=model_args["graph_sigma_scale"],
             width=model_args["width"],
             depth=model_args["depth"],
             dropout=model_args["dropout"],
-        )
-    elif model_name == "meshgraphnet":
-        model = MeshGraphNet(
-            in_channels=model_args["in_channels"],
-            out_channels=model_args["out_channels"],
-            spatial_dim=model_args["spatial_dim"],
-            edge_index=edge_index,
-            width=model_args["width"],
-            depth=model_args["depth"],
         )
     else:
         raise ValueError(f"unknown model_name: {model_name}")
@@ -198,9 +397,22 @@ def build_trainer(
         rollout_patience=args.rollout_patience,
         noise_std_init=args.noise_std_init,
         noise_decay=args.noise_decay,
+        max_history_steps=args.max_history_steps,
+        history_length_alpha=args.history_length_alpha,
+        history_sigma_min=args.history_sigma_min,
+        history_sigma_max=args.history_sigma_max,
+        history_sigma_alpha=args.history_sigma_alpha,
+        use_weighted_loss=args.use_weighted_loss,
+        use_causal_weighting=args.use_causal_weighting,
+        causal_weight_eps=args.causal_weight_eps,
         channel_weights=args.channel_weights,
         bc=getattr(args, "bc", None),
     )
+
+
+# ============================================================
+# Data And Workflows
+# ============================================================
 
 
 def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
@@ -242,7 +454,9 @@ def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
             torch.tensor(t0_norm, dtype=seq.dtype),
             torch.tensor(dt_norm, dtype=seq.dtype),
         )
-        for seq, coords, t0_norm, dt_norm in zip(train_data.seqs, train_data.coords, train_data.t0_norm, train_data.dt_norm)
+        for seq, coords, t0_norm, dt_norm in zip(
+            train_data.seqs, train_data.coords, train_data.t0_norm, train_data.dt_norm
+        )
     ]
     val_dataset = [
         (
@@ -271,9 +485,19 @@ def data_pipeline(args: Any) -> Tuple[DataLoader, DataLoader, FlowData]:
     return train_loader, val_loader, test_data
 
 
+def _checkpoint_params(args: Any, model_args: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "channel_names": args.channel_names,
+        "model_args": model_args,
+        "graph_k": args.graph_k,
+        "graph_sigma_scale": args.graph_sigma_scale,
+        "bc": args.bc.state_dict() if args.bc is not None else None,
+    }
+
+
 def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) -> None:
     """
-    Probe peak GPU memory and projected training time.
+    Run a lightweight single-batch compute and memory probe.
 
     Args:
         args (Any): Parsed arguments.
@@ -283,164 +507,68 @@ def probe_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
     logger.info(f"{hue.c}============================= [PROBE PIPELINE] START =============================={hue.q}")
 
     device = torch.device(args.device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        logger.warning("CUDA is unavailable, probe skipped.")
-        logger.info(f"{hue.g}============================== [PROBE PIPELINE] END ==============================={hue.q}")
-        return
-
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ref_coords = train_loader.dataset[0][1]
-    adj_indices, adj_values, edge_index = build_local_graph(
-        coords=ref_coords,
-        k=args.graph_k,
-        sigma_scale=args.graph_sigma_scale,
-    )
-    model, model_args = build_model(
-        args=args,
-        adj_indices=adj_indices,
-        adj_values=adj_values,
-        edge_index=edge_index,
-    )
-    model_name = model_args["model_name"]
-    params = {
-        "channel_names": args.channel_names,
-        "model_args": model_args,
-        "graph_k": args.graph_k,
-        "graph_sigma_scale": args.graph_sigma_scale,
-        "bc": args.bc.state_dict() if args.bc is not None else None,
-    }
-    scalers = {
-        "state_scaler": args.state_scaler,
-        "coord_scaler": args.coord_scaler,
-    }
-    trainer = build_trainer(args, model, params, scalers, output_dir)
+    model, model_args = build_model(args=args)
+    scalers = {"state_scaler": args.state_scaler, "coord_scaler": args.coord_scaler}
+    trainer = build_trainer(args, model, _checkpoint_params(args, model_args), scalers, output_dir)
 
     train_batch = tuple(t.to(device) for t in next(iter(train_loader)))
     val_batch = tuple(t.to(device) for t in next(iter(val_loader)))
-
     reachable_rollout = min(args.max_rollout_steps, train_batch[0].shape[1] - 1)
-    if args.rollout_patience > 0:
-        scheduled_rollout = 1 + max(args.max_epochs - 1, 0) // args.rollout_patience
-        reachable_rollout = min(reachable_rollout, scheduled_rollout)
     sample_steps = sorted({1, max(1, reachable_rollout // 2), reachable_rollout})
 
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
 
-    train_times = []
+    logs = []
     for rollout_steps in sample_steps:
         trainer.current_rollout_steps = rollout_steps
-        trainer.current_noise_std = trainer.noise_std_init
+        trainer.current_noise_std = args.noise_std_init if args.use_noise else 0.0
+        trainer._sync_curriculum_state()
         trainer.model.train()
 
-        durations = []
-        for repeat_idx in range(3):
-            trainer.optimizer.zero_grad(set_to_none=True)
+        start = time.perf_counter()
+        trainer.optimizer.zero_grad(set_to_none=True)
+        loss = trainer._compute_loss(train_batch)
+        loss.backward()
+        trainer.optimizer.step()
+        if device.type == "cuda":
             torch.cuda.synchronize(device)
-            start = time.perf_counter()
-            loss = trainer._compute_loss(train_batch)
-            loss.backward()
-            trainer.optimizer.step()
-            torch.cuda.synchronize(device)
-            if repeat_idx > 0:
-                durations.append(time.perf_counter() - start)
-        train_times.append(sum(durations) / len(durations))
+        train_seconds = time.perf_counter() - start
 
-    val_times = []
-    for rollout_steps in sample_steps:
-        trainer.current_rollout_steps = rollout_steps
-        trainer.current_noise_std = 0.0
         trainer.model.eval()
-
-        durations = []
         with torch.no_grad():
-            for repeat_idx in range(3):
+            start = time.perf_counter()
+            val_loss = trainer._compute_loss(val_batch)
+            if device.type == "cuda":
                 torch.cuda.synchronize(device)
-                start = time.perf_counter()
-                trainer._compute_loss(val_batch)
-                torch.cuda.synchronize(device)
-                if repeat_idx > 0:
-                    durations.append(time.perf_counter() - start)
-        val_times.append(sum(durations) / len(durations))
+            val_seconds = time.perf_counter() - start
 
-    if len(sample_steps) == 1:
-        train_bias, train_slope = 0.0, train_times[0]
-        val_bias, val_slope = 0.0, val_times[0]
-    else:
-        x = torch.tensor(sample_steps, dtype=torch.float64)
-        x_centered = x - x.mean()
-        denom = torch.dot(x_centered, x_centered).item()
-
-        y = torch.tensor(train_times, dtype=torch.float64)
-        train_slope = float(torch.dot(x_centered, y - y.mean()).item() / denom)
-        train_bias = float((y.mean() - train_slope * x.mean()).item())
-
-        y = torch.tensor(val_times, dtype=torch.float64)
-        val_slope = float(torch.dot(x_centered, y - y.mean()).item() / denom)
-        val_bias = float((y.mean() - val_slope * x.mean()).item())
-
-    rollout_schedule = []
-    for epoch_idx in range(args.max_epochs):
-        if args.rollout_patience <= 0:
-            rollout_schedule.append(reachable_rollout)
-        else:
-            step = 1 + epoch_idx // args.rollout_patience
-            rollout_schedule.append(min(step, reachable_rollout))
-
-    epoch_seconds = []
-    for rollout_steps in rollout_schedule:
-        train_epoch = len(train_loader) * (max(train_bias, 0.0) + max(train_slope, 0.0) * rollout_steps)
-        val_epoch = len(val_loader) * (max(val_bias, 0.0) + max(val_slope, 0.0) * rollout_steps)
-        epoch_seconds.append(train_epoch + val_epoch)
-
-    total_seconds = float(sum(epoch_seconds))
-    finish_at = datetime.now().astimezone() + timedelta(seconds=total_seconds)
-
-    trainer.current_rollout_steps = reachable_rollout
-    trainer.current_noise_std = 0.0
-    trainer.model.train()
-    trainer.optimizer.zero_grad(set_to_none=True)
-    torch.cuda.reset_peak_memory_stats(device)
-    loss = trainer._compute_loss(train_batch)
-    loss.backward()
-    trainer.optimizer.step()
-    torch.cuda.synchronize(device)
+        logs.append((rollout_steps, trainer.current_history_steps, loss.item(), val_loss.item(), train_seconds, val_seconds))
 
     B, T, N, C = train_batch[0].shape
     total_params = sum(p.numel() for p in trainer.model.parameters())
-    peak = torch.cuda.max_memory_allocated(device)
-    total_mem = torch.cuda.get_device_properties(device).total_memory
-    pct = 100.0 * peak / total_mem
-
-    if pct < 75.0:
-        status = f"{hue.g}SAFE{hue.q}"
-    elif pct < 92.0:
-        status = f"{hue.y}WARNING - close to limit{hue.q}"
-    else:
-        status = f"{hue.r}CRITICAL - likely OOM in real training{hue.q}"
+    peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
 
     logger.info(
         f"{hue.y}probe config:{hue.q} "
-        f"model={hue.b}{model_name}{hue.q}, class={hue.b}{model.__class__.__name__}{hue.q}, "
-        f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, "
-        f"nodes={hue.m}{N}{hue.q}, channels={hue.m}{C}{hue.q}, "
-        f"rollout={hue.m}{reachable_rollout}{hue.q}/{hue.m}{min(args.max_rollout_steps, T - 1)}{hue.q}, "
-        f"params={hue.m}{total_params}{hue.q}"
+        f"model={hue.b}{model_args['model_name']}{hue.q}, class={hue.b}{model.__class__.__name__}{hue.q}, "
+        f"batch={hue.m}{B}{hue.q}, frames={hue.m}{T}{hue.q}, nodes={hue.m}{N}{hue.q}, "
+        f"channels={hue.m}{C}{hue.q}, params={hue.m}{total_params}{hue.q}"
     )
-    logger.info(
-        f"{hue.y}device:{hue.q} {hue.b}{torch.cuda.get_device_name(device)}{hue.q} "
-        f"({hue.m}{total_mem / 1e9:.1f}{hue.q} GB)"
-    )
-    logger.info(
-        f"{hue.y}peak usage:{hue.q} {hue.m}{peak / 1e9:.2f}{hue.q} GB "
-        f"({hue.m}{pct:.1f}{hue.q} %) -> {status}"
-    )
-    logger.info(
-        f"{hue.y}train eta:{hue.q} {hue.m}{total_seconds / 3600.0:.1f}{hue.q} h "
-        f"-> {hue.b}{finish_at.strftime('%m-%d %H:%M')}{hue.q}"
-    )
+    for rollout_steps, history_steps, train_loss, val_loss, train_seconds, val_seconds in logs:
+        logger.info(
+            f"{hue.y}probe step:{hue.q} rollout={hue.m}{rollout_steps}{hue.q}, "
+            f"history={hue.m}{history_steps}{hue.q}, train={hue.m}{train_loss:.4e}{hue.q} "
+            f"({hue.c}{train_seconds:.2f}s{hue.q}), val={hue.m}{val_loss:.4e}{hue.q} "
+            f"({hue.c}{val_seconds:.2f}s{hue.q})"
+        )
+    if device.type == "cuda":
+        logger.info(f"{hue.y}peak memory:{hue.q} {hue.m}{peak / 1e9:.2f}{hue.q} GB")
+
     logger.info(f"{hue.g}============================== [PROBE PIPELINE] END ==============================={hue.q}")
 
 
@@ -458,32 +586,11 @@ def train_pipeline(args: Any, train_loader: DataLoader, val_loader: DataLoader) 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ref_coords = train_loader.dataset[0][1]
-    adj_indices, adj_values, edge_index = build_local_graph(
-        coords=ref_coords,
-        k=args.graph_k,
-        sigma_scale=args.graph_sigma_scale,
-    )
-    model, model_args = build_model(
-        args=args,
-        adj_indices=adj_indices,
-        adj_values=adj_values,
-        edge_index=edge_index,
-    )
-    params = {
-        "channel_names": args.channel_names,
-        "model_args": model_args,
-        "graph_k": args.graph_k,
-        "graph_sigma_scale": args.graph_sigma_scale,
-        "bc": args.bc.state_dict() if args.bc is not None else None,
-    }
-    scalers = {
-        "state_scaler": args.state_scaler,
-        "coord_scaler": args.coord_scaler,
-    }
+    model, model_args = build_model(args=args)
+    scalers = {"state_scaler": args.state_scaler, "coord_scaler": args.coord_scaler}
 
     logger.info(f"train model with {hue.m}{sum(p.numel() for p in model.parameters())}{hue.q} parameters")
-    trainer = build_trainer(args, model, params, scalers, output_dir)
+    trainer = build_trainer(args, model, _checkpoint_params(args, model_args), scalers, output_dir)
     trainer.fit(train_loader, val_loader)
 
     logger.info(f"{hue.g}============================== [TRAIN PIPELINE] END ==============================={hue.q}")
@@ -516,31 +623,22 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
     coord_scaler = MinMaxScalerTensor(norm_range="bipolar")
     coord_scaler.load_state_dict(scaler_state["coord_scaler"])
 
-    ref_coords = coord_scaler.transform(test_data.coords[0])
-    adj_indices, adj_values, edge_index = build_local_graph(
-        coords=ref_coords,
-        k=params["graph_k"],
-        sigma_scale=params["graph_sigma_scale"],
-    )
-    model, _ = build_model(
-        model_args=params["model_args"],
-        adj_indices=adj_indices,
-        adj_values=adj_values,
-        edge_index=edge_index,
-    )
+    model_args = params["model_args"]
+    model, _ = build_model(model_args=model_args)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
 
     channel_names = params["channel_names"]
+    spatial_dim = model_args["spatial_dim"]
     total_params = sum(p.numel() for p in model.parameters())
-    visualizer = FlowVis(output_dir=output_dir, spatial_dim=args.spatial_dim, channel_names=channel_names)
+    visualizer = FlowVis(output_dir=output_dir, spatial_dim=spatial_dim, channel_names=channel_names)
     flow_twin = FlowTwin(output_dir=output_dir, channel_names=channel_names)
     metrics = Metrics(channel_names)
     metrics_bank = {}
 
     focus_channel_idx = channel_names.index("Vy")
-    focus_bbox_rel = (0.60, 1.00, 0.00, 1.00) if args.spatial_dim == 2 else (0.60, 1.00, 0.00, 1.00, 0.00, 1.00)
+    focus_bbox_rel = (0.60, 1.00, 0.00, 1.00) if spatial_dim == 2 else (0.60, 1.00, 0.00, 1.00, 0.00, 1.00)
 
     for seq, coords, label in zip(test_data.seqs, test_data.coords, test_data.labels):
         gt_seq = seq.cpu()
@@ -610,7 +708,7 @@ def infer_pipeline(args: Any, test_data: FlowData) -> None:
 
 
 if __name__ == "__main__":
-    args = config.get_args()
+    args = get_args()
     seed_everything(args.seed)
 
     train_loader, val_loader, test_data = data_pipeline(args)

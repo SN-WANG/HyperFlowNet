@@ -11,7 +11,7 @@
 ## Active Code Path
 
 - The active workflow is `main.py -> FlowData -> BoundaryCondition -> HyperFlowTrainer -> HyperFlowNet -> Metrics / FlowVis / FlowTwin`.
-- `config.py` is the canonical source for default command-line options and experiment knobs.
+- `config.yaml` is the canonical source for default experiment knobs; `main.py` loads it directly.
 - Keep agent notes limited to modules and mechanisms that exist in the current repository code.
 
 ## Dataset Contract
@@ -54,7 +54,7 @@
 - Treat `training/base_trainer.py` and `utils/*` as mature WSNet-style shared scripts. Do not casually redesign or fork them inside HyperFlowNet.
 - If a real shared-infrastructure fix is needed for `base_trainer` or `utils`, the preferred workflow is to make or finalize the change in WSNet, then sync HyperFlowNet deliberately.
 - `models/hflownet.py` is the main local fast-iteration area. Once a model change is validated here, sync or back-port it to WSNet on purpose.
-- `main.py`, `config.py`, `data/*`, `training/hflow_trainer.py`, and visualization logic are HyperFlowNet-local and should evolve directly in this repository.
+- `main.py`, `config.yaml`, `data/*`, `training/hflow_trainer.py`, and visualization logic are HyperFlowNet-local and should evolve directly in this repository.
 
 ## Practical Change Strategy
 

@@ -15,14 +15,16 @@ The current scope includes:
 
 - fixed-mesh flow simulation
 - autoregressive rollout learning on Fluent-style CFD sequences
-- graph-injected slice attention for irregular mesh nodes
+- annealed sliding-history kernel attention for irregular mesh nodes
 - hard no-slip wall boundary condition enforcement
 - case-wise comparison, focused-region, and digital-twin visualization
 
 ## ✨ Highlights
 
 - `HyperFlowNet` as a spatio-temporal neural operator for flow rollout prediction
-- Two graph modes through `--graph_mode`: `bias` and `assign`
+- YAML-driven experiments through `config.yaml`
+- Annealed history schedule with shrinking history, decaying rollout noise, and growing rollout horizon
+- Structural bias, token gating, and weighted causal rollout loss ablations
 - Hard boundary condition projection through `bc` during training and inference rollout
 - Weighted autoregressive NMSE training with rollout curriculum and noise decay
 - Deterministic first-frame reconstruction from `case_<label>` and mesh coordinates
@@ -33,7 +35,7 @@ The current scope includes:
 ```text
 HyperFlowNet/
 ├── main.py                  # Unified entry point for probe / train / infer
-├── config.py                # Command-line arguments and experiment configuration
+├── config.yaml              # Experiment configuration
 ├── models/
 │   └── hflownet.py
 ├── data/
@@ -75,31 +77,31 @@ MP4 rendering uses system `ffmpeg`. Make sure `ffmpeg` is on `PATH`, or set `FFM
 ### Probe GPU memory before training
 
 ```bash
-python main.py --mode probe --data_dir ./dataset --output_dir ./runs
+python main.py --config config.yaml --mode probe
 ```
 
 ### Train HyperFlowNet
 
 ```bash
-python main.py --mode train --data_dir ./dataset --output_dir ./runs
+python main.py --config config.yaml --mode train
 ```
 
-### Run a graph-mode ablation
+### Run an ablation
 
 ```bash
-python main.py --mode train --graph_mode assign --data_dir ./dataset --output_dir ./runs_assign
+python main.py --config config.yaml --ablation bias --mode train --output_dir runs_bias_ablation
 ```
 
 ### Run inference and generate visualizations
 
 ```bash
-python main.py --mode infer --data_dir ./dataset --output_dir ./runs
+python main.py --config config.yaml --mode infer
 ```
 
 ### Run the full workflow
 
 ```bash
-python main.py --mode probe train infer --data_dir ./dataset --output_dir ./runs
+python main.py --config config.yaml --mode probe train infer
 ```
 
 ## 📂 Expected Data Format
@@ -153,7 +155,7 @@ runs/
 └── <label>_twin_vorticity_<section|isosurface>.mp4
 ```
 
-Checkpoints store model arguments, graph settings, and `bc` state in `params`, while state and coordinate scalers are stored separately in `scaler_state_dict`.
+Checkpoints store model arguments and `bc` state in `params`, while state and coordinate scalers are stored separately in `scaler_state_dict`.
 
 ## 🔗 Relationship to WSNet
 
