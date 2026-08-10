@@ -1,79 +1,53 @@
-# Run from the project root:
-#   python main.py --config config.yaml --mode train
-#   python main.py --config config.yaml --mode probe train infer
-# Ablation choices:
-#   none, time_encoding, spatial_encoding, noise, rollout, bc, bias, gating, loss
-
-general:
-  seed: 42
-  data_dir: "dataset"
-  output_dir: "runs"
-  mode: ["probe", "train", "infer"]
-  device: "auto"
-  model_name: "hflownet"
-  ablation: "none"
+# Default configuration for HyperFlowNet experiments
+# Author: Shengning Wang
 
 data:
-  channel_names: ["Vx", "Vy", "P", "T"]
-  spatial_dim: 2
-  win_len: 12
-  win_stride: 1
-  batch_size: 8
+  dataset: burgers_1d
+  data_dir: data/raw
+  n_train: 96
+  n_test: 16
+  grid: 256
+  n_steps: 200
+  nu: 0.02
+  dt: 0.005
+  channels: 1
+  seed: 0
 
 model:
+  name: HyperFlowNet
+  backbone: UWNO
+  corrector: fno
+  modes: 16
+  width: 64
   depth: 4
-  width: 128
-  num_slices: 32
-  num_heads: 8
-  coord_features: 8
-  time_features: 4
-  lag_features: 4
-  freq_base: 1000
-  dropout: 0.0
-  use_spatial_encoding: true
-  use_time_encoding: true
-  use_bias: true
-  use_gating: true
-  bias_beta_init: 1.0
-  gate_beta_init: 1.0
-  space_tau_init: 1.0
+  flow_steps: 8
+  patch_size: 16
+  heads: 4
+  dim: 64
+  refine_steps: 2
 
-baselines:
-  graph_k: 12
-  graph_sigma_scale: 1.5
-  transolver_mlp_ratio: 1
-  transolver_use_time_input: true
-  transolver_unified_pos: true
-  transolver_ref: 8
-  geofno_modes: [12]
-  geofno_grid_size: [64]
-  gino_modes: [12]
-  gino_grid_size: [64]
-  gino_neighbors: 16
+training:
+  steps_stage1: 250
+  steps_stage2: 250
+  batch: 256
+  lr: 1e-3
+  bptt: 2
+  objective: hyflow
+  seed: 0
+  checkpoint_dir: runs/exp
 
-boundary:
-  use_bc: true
-  bc_threshold: 0.0001
+eval:
+  rollout: 200
+  metrics:
+    - global_l2
+    - shock_l2
+    - tv_ratio
+    - front_offset
+    - shape_error
+    - transport_error
+    - spectrum_error
 
-trainer:
-  lr: 0.0005
-  weight_decay: 0.0001
-  max_epochs: 560
-  eta_min: 0.000001
-  channel_weights: [1.0, 3.0, 1.0, 1.0]
-  use_weighted_loss: true
-  use_causal_weighting: true
-  causal_weight_eps: 1.0
-
-curriculum:
-  use_noise: true
-  use_rollout: true
-  max_rollout_steps: 11
-  rollout_patience: 55
-  noise_std_init: 0.01
-  noise_decay: 0.7
-  max_history_steps: 4
-  history_length_alpha: 1.0
-  history_sigma_min: 0.25
-  history_sigma_max: 2.0
-  history_sigma_alpha: 1.0
+mechanism:
+  sigmas: [0.25, 0.5, 1.0, 2.0, 4.0]
+  n_samples: 8192
+  n_grid: 256

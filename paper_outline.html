@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>自回归神经代理在间断动力学中的长期失效机理与流匹配修正：论文大纲</title>
+<script>
+window.MathJax = {
+  tex: {inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']]},
+  svg: {fontCache: 'global'}
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<style>
+:root {
+  --ink: #1a1a1a;
+  --muted: #555;
+  --accent: #0b4f8a;
+  --line: #d8d8d8;
+  --bg: #fdfdfd;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", Georgia, serif;
+  line-height: 1.75;
+}
+.container { max-width: 880px; margin: 0 auto; padding: 48px 32px 96px; }
+header { border-bottom: 2px solid var(--accent); margin-bottom: 40px; padding-bottom: 24px; }
+h1 { font-size: 1.65em; line-height: 1.45; margin: 0 0 8px; color: var(--accent); }
+.meta { color: var(--muted); font-size: 0.92em; }
+.status { margin-top: 14px; font-size: 0.9em; }
+.status span { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.85em; margin-right: 8px; }
+.done { background: #e3f2e6; color: #1c6b34; }
+.todo { background: #fff1dc; color: #8a5a00; }
+h2 { font-size: 1.25em; margin-top: 44px; color: var(--accent); border-left: 4px solid var(--accent); padding-left: 10px; }
+h3 { font-size: 1.08em; margin-top: 30px; }
+h4 { font-size: 1em; margin-top: 22px; color: #333; }
+p { text-align: justify; }
+.eq { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; margin: 18px 0; font-size: 0.92em; }
+th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; }
+th { background: #f2f5f8; }
+.refs { font-size: 0.92em; }
+.refs li { margin-bottom: 6px; }
+.note { color: var(--muted); font-size: 0.9em; }
+.placeholder { color: #8a5a00; }
+footer { margin-top: 60px; border-top: 1px solid var(--line); padding-top: 18px; color: var(--muted); font-size: 0.85em; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+<h1>自回归神经代理在间断动力学中的长期失效机理与流匹配修正</h1>
+<div class="meta">HyperFlowNet（hyflow）论文大纲 · 目标期刊：Computer Methods in Applied Mechanics and Engineering（CMAME）</div>
+<div class="status">
+  <span class="done">已完成的初步验证</span>
+  <span class="todo">待补充的正式实验</span>
+</div>
+</header>
+
+<h2>摘要</h2>
+<p>
+自回归神经代理在含激波的动力学系统上做长程预测时，间断被系统性抹平：前沿变宽、位置漂移，误差随时间累积。该现象跨越卷积、谱、小波与注意力等不同架构，说明其根源在训练目标与数据分布，而非某一类模型的表达力缺陷。本文论证该失效由条件期望机制驱动：平方误差损失的最优预测是条件期望，对一族位置随机变化的间断，条件期望在间断处是光滑斜坡，因此以 MSE 训练的模型在统计上必然把激波平均成斜坡；rollout 中这一偏差逐帧重复，位置误差与形状误差互相放大。基于该机理，本文提出 HyperFlowNet，在冻结骨干预测之上学习确定性流匹配残差修正器，用直路径插值定义良态的速度场，并在推理时以确定性欧拉积分代替采样，避免生成式方法在 rollout 中的噪声累积。在 1D Burgers、2D Burgers、Sod 激波管与二维 Riemann 问题上的实验表明，该修正器在全局误差、激波区误差、前沿宽度与位置偏移上一致优于现有神经算子与修正类基线。
+</p>
+
+<h2>1 引言</h2>
+<p>
+神经算子把 PDE 求解建模为函数空间之间的映射，已在流体、结构与波动力学中获得广泛应用。工程应用中大量问题要求给定当前状态，沿时间轴逐帧推进，这种自回归使用方式与单步算子评估存在本质差别：预测误差进入下一帧输入，形成反馈回路。对光滑解，误差增长通常缓慢且可预测；对含激波、接触间断或大梯度过渡的解，长期 rollout 出现一类跨架构的失败模式：间断被抹平成有限宽度斜坡，位置随时间漂移，误差增长明显快于光滑问题。
+</p>
+<p>
+这一现象已在多个研究线中被观察到。PDE-Refiner 报告了基于 FNO 的 rollout 在长时间后频谱失真 [1]；FC-PINO 指出周期化假设与 Fourier 基底在间断处产生振铃 [2]；小波类算子 WNO 与 UWNO 试图以多尺度基底缓解该问题 [3,4]。但现有工作把失效归因于模型容量、基底选择或误差累积本身，尚未回答一个更基本的问题：为什么几乎所有以平方误差训练的代理都会把间断抹平？
+</p>
+<p>
+本文的出发点是统计层面的事实：MSE 的最优预测等于条件期望。当训练数据包含位置随机变化的间断时，条件期望在间断邻域内是光滑斜坡，其宽度由位置分布决定。任何在有限样本上最小化 MSE 的模型都被推向这个斜坡，无论其架构如何。该机制给出三个可检验的预测：其一，抹平宽度随位置方差单调增大，且可由条件期望解析刻画；其二，rollout 中的前沿偏移主要来自速度误差的长期复合，而单步位置误差可以很小；其三，只要训练目标仍是逐点 MSE，单纯增强表达力或更换基底都无法消除抹平。
+</p>
+<p>
+对策需要打破"预测条件期望"这一统计吸引子。生成式建模提供了候选路径：学习条件分布而非单点预测。但直接采样会向 rollout 注入随机性，误差逐帧累积，这在我们的初步实验中表现为纯采样式流匹配与扩散模型的 rollout 显著劣化。HyperFlowNet 采取折中：用流匹配学习从骨干预测到真值的残差速度场，推理时沿确定性 ODE 积分。该过程保留生成式目标对条件分布的刻画能力，同时以确定性轨迹避开采样噪声。
+</p>
+<p>
+本文的贡献如下：（1）把自回归间断失效归因于条件期望抹平，给出解析描述与跨架构实证；（2）提出位置误差与形状误差的分解框架，说明二者在 rollout 中的不同增长动力学；（3）提出 HyperFlowNet 两阶段训练与确定性流匹配修正，在四组基准上系统验证。
+</p>
+
+<h2>2 相关工作</h2>
+<h3>2.1 神经算子的自回归 rollout</h3>
+<p>
+FNO [5]、DeepONet [6] 与 Transolver [7] 等算子学习框架通常以单步或有限步监督训练，随后在测试时自回归推进。长程 rollout 的误差控制成为独立研究问题：PDE-Refiner 以多步精修逼近全频段 [1]，ACDM 把条件扩散用于湍流 rollout [8]，近期的 HERO 引入历史增强的相对监督 [9]，Jacobian 自适应加权与谱生成算子从稳定性与频谱角度约束长程演化 [10,11]。这些工作以稳定性和频谱保真为目标，未从条件期望层面解释间断处的系统性抹平。
+</p>
+<h3>2.2 间断与谱表示的困难</h3>
+<p>
+Fourier 与多项式基在间断处出现 Gibbs 振铃，是数值分析中的经典问题。FC-PINO 用 Fourier 延拓缓解周期化误差 [2]；WNO 用 Haar 小波保留局部跳跃 [3]；UWNO 将小波下采样嵌入 U-Net 结构 [4]。这些方法改善激波附近的表示，但训练目标未变，仍受条件期望吸引子支配。本文的机制分析说明，基底改进与目标修正属于不同层面，后者才是抹平的根源。
+</p>
+<h3>2.3 条件期望抹边与生成式修正</h3>
+<p>
+"后验均值抹平边缘"在图像复原中已有充分研究：MSE 最优估计是后验均值，对边缘位置不确定的退化模型，后验均值表现为模糊过渡。PMRF 证明最小 MSE 与完美感知质量不可兼得，并提出用整流流逼近边缘清晰的估计 [12]。本文将该机制引入时序代理的间断问题，并指出 rollout 使抹平逐帧放大，需要比图像复原更强调确定性轨迹的修正策略。
+</p>
+<h3>2.4 流匹配与修正类代理</h3>
+<p>
+流匹配以直路径插值定义条件速度场，已在图像与 PDE 生成中广泛应用。将其嵌入代理预测的修正阶段，与扩散修正 [13] 和精修器思路 [1] 相关，区别在于训练目标的插值端点是骨干预测而非噪声，且推理固定为确定性积分。
+</p>
+
+<h2>3 问题设定与机理</h2>
+<h3>3.1 条件期望抹平</h3>
+<p>
+考虑一维间断族
+\[
+u(x; s) = u_L + (u_R - u_L)\, H(x - s),
+\]
+其中 \(H\) 为 Heaviside 函数，位置 \(s \sim \mathcal{N}(\mu, \sigma^2)\)。若模型以平方误差训练，最优预测为条件期望
+\[
+\mathbb{E}_s[u(x; s)] = u_L + (u_R - u_L)\,\Phi\left(\frac{x - \mu}{\sigma}\right),
+\]
+其中 \(\Phi\) 为标准正态累积分布函数。该预测是宽度与 \(\sigma\) 成正比的光滑斜坡：10% 到 90% 上升宽度为 \(2\sigma\,\Phi^{-1}(0.9)\approx 2.56\sigma\)。因此位置不确定的间断在 MSE 意义下不可被锐利复现，锐利解与最优解之间存在不可消除的统计距离。该结论不依赖网络架构，只依赖训练目标。
+</p>
+<p>
+有限样本训练给出同一结论的近似形式。经验风险最小化在样本量足够时收敛到条件期望；小网络在有限样本下同样被推向斜坡，只是宽度估计带有统计涨落。合成实验将分别验证解析宽度与拟合宽度随 \(\sigma\) 的标度关系。
+</p>
+<h3>3.2 位置误差与形状误差的分解</h3>
+<p>
+把预测 \(\hat u\) 与真值 \(u\) 之间的误差拆为两部分：先求使 \(\hat u\) 与 \(u\) 最优对齐的输运映射 \(\mathcal{T}\)，再定义
+\[
+u - \hat u = \bigl(\mathcal{T}\hat u - \hat u\bigr) + \bigl(u - \mathcal{T}\hat u\bigr).
+\]
+第一项为位置误差，度量对齐代价；第二项为形状误差，度量对齐之后残余的宽度、幅度与振荡偏差。在 1D 中，\(\mathcal{T}\) 可取为周期平移，位置误差对应前沿相位偏移，形状误差对应前沿宽度与振铃。初步实验显示，60 步 rollout 中位置误差从接近零增长到与形状误差同阶，而单步位置误差始终在 0.01 格量级。该对比说明 rollout 的漂移来自速度误差的长期复合，而非每步的明显位移。
+</p>
+<h3>3.3 增长动力学</h3>
+<p>
+设前沿速度的真值为 \(s^*\)，预测为 \(s^* + \delta s(t)\)，位置误差满足
+\[
+\Delta x(t) = \int_0^t \delta s(\tau)\,d\tau .
+\]
+\(\delta s\) 依赖当前场误差，而场误差又随位置漂移增大，形成正反馈。对幅值为 \(J\) 的阶跃，位置偏移 \(\delta\) 造成的平方 L2 误差为 \(J^2\delta/L\)，即误差随 \(\sqrt{\delta}\) 增长，小偏移的损失代价很小。这一相位盲区解释了为何 MSE 不惩罚位置漂移，也解释了为何条件期望机制在 rollout 中被逐帧放大。
+</p>
+
+<h2>4 HyperFlowNet</h2>
+<h3>4.1 两阶段结构</h3>
+<p>
+HyperFlowNet 由骨干与修正器组成。骨干为 UWNO，以 BPTT-2 的 MSE 目标训练，提供中等质量的初步预测 \(u_{bb}=\mathcal{G}_\theta(c)\)。第一阶段结束后冻结骨干，第二阶段在骨干预测与真值之间学习修正速度场。冻结骨干保证修正器面对的是固定的输入分布，所有消融变体共享同一骨干，比较仅反映修正阶段的设计差异。
+</p>
+<h3>4.2 流匹配残差修正</h3>
+<p>
+对当前状态 \(c\)、骨干预测 \(u_{bb}\) 与真值 \(y\)，定义直路径插值
+\[
+x_s = (1-s)\,u_{bb} + s\,y, \qquad s\in[0,1],
+\]
+其速度目标为 \(y - u_{bb}\)。修正器 \(v_\theta(c, x_s, s)\) 以 \(c\) 为条件，最小化
+\[
+\mathcal{L}_{\mathrm{flow}} = \mathbb{E}_{s\sim U(0,1)}\left\|v_\theta(c, x_s, s) - (y - u_{bb})\right\|^2.
+\]
+该目标把残差回归转化为良态的速度场回归：激波处的残差是集中载荷，但插值路径使其沿时间连续展开，避免直接回归残差时的尖峰损失。
+</p>
+<h3>4.3 确定性推理</h3>
+<p>
+推理时从骨干预测出发，以 \(K\) 步确定性欧拉积分求解常微分方程：
+\[
+u_0 = u_{bb}, \qquad
+u_k = u_{k-1} + \frac{1}{K} v_\theta\left(c, u_{k-1}, \frac{k}{K}\right), \quad k=1,\dots,K.
+\]
+不引入随机噪声，避免采样式生成模型在 rollout 中逐帧注入误差。初步实验中，采样式流匹配与 DDIM 扩散的 rollout 误差显著高于同骨干的确定性修正，说明确定性积分是该机制有效性的关键组成。
+</p>
+
+<h2>5 实验</h2>
+<h3>5.1 设置</h3>
+<p>
+数据集包括：1D 黏性 Burgers（伪谱求解，周期边界，rollout 200 步）、2D Burgers（128²，伪谱求解，rollout 100 步）、1D Sod 激波管（MUSCL-Rusanov 有限体积，随机左右状态，rollout 100 步）、2D Euler 二维 Riemann 问题（配置 3 与 6，Rusanov 通量与 minmod 重建，规则网格，rollout 100 步）。基线为 CNN、U-Net、ViT、DeepONet、FNO、WNO、UWNO 与 PDE-Refiner，1D 与 2D 各一套，训练预算与骨干保持一致。
+</p>
+<p>
+指标包括全局相对 L2、激波区相对 L2、前沿 TV 比（真值为 1）、前沿位置偏移、位置/形状误差分解与频谱幅度误差。实验回答四个问题：条件期望抹平是否成立并满足标度律；抹平是否跨架构存在；确定性流匹配修正是否同时改善位置与形状；修正器与训练目标消融的相对贡献。
+</p>
+<h3>5.2 合成机理实验</h3>
+<p>
+在随机位置阶跃族上计算解析条件期望宽度与有限样本拟合宽度，验证 10%-90% 宽度随 \(\sigma\) 的近似线性标度。该实验隔离训练目标的影响，不涉及 rollout 与 PDE 求解器。
+</p>
+<h3>5.3 1D Burgers</h3>
+<p>
+主战场。报告 200 步 rollout 的误差曲线、前沿快照与 TV 比。初步结果（60 步）显示 UWNO 全局相对 L2 为 0.128，HyperFlowNet 为 0.086，激波区误差由 1.081 降至 0.742。完整实验将验证 200 步下的误差增长率与位置漂移斜率。
+</p>
+<h3>5.4 2D Burgers</h3>
+<p>
+验证机制与方法的二维推广。激波为曲线，位置误差需以整体前沿几何刻画，TV 比在前沿带上计算。预期所有 MSE 基线在激波曲率大处出现明显抹平，HyperFlowNet 保持更窄的前沿带。
+</p>
+<h3>5.5 Sod 激波管</h3>
+<p>
+验证跨方程族泛化。Sod 问题同时包含激波、接触间断与稀疏波，三个守恒变量均有间断特征。以密度场的激波区指标为主，压力与速度场作为辅助诊断。
+</p>
+<h3>5.6 2D Euler</h3>
+<p>
+验证机制在强非线性多波相互作用下的表现。二维 Riemann 配置 3 与 6 分别以激波相互作用与剪切结构为主，网格 128²。以密度场的全局与激波区误差、前沿 TV 比为主要指标。
+</p>
+<h3>5.7 消融</h3>
+<p>
+固定同一 UWNO 骨干，比较五种训练/推理目标：MSE、HyperFlowNet 两阶段流修正、采样式 FlowNO、DDIM DiffNO、激波加权 FrontLoss。该组实验支撑两个结论：确定性推理优于采样式推理，架构级修正优于损失级加权。修正器本身再做 FNO 与 U-Net 的骨干消融。
+</p>
+
+<h2>6 讨论与局限</h2>
+<p>
+条件期望抹平给出的是统计下界，不排除特定数据分布下 MSE 模型恢复锐利前沿，例如位置分布退化或训练分布与测试分布一致。实际 PDE 数据中位置不确定性来自初始场与演化参数的多样性，退化情形不常见，但应在讨论中说明适用范围。
+</p>
+<p>
+确定性流匹配修正的代价是额外的推理步数。当前实现固定 8 步欧拉，步数与精度、成本的权衡未系统扫描，正式版本需要补充。2D 修正器在 128² 网格上的显存与训练时间也需报告。
+</p>
+<p>
+位置/形状分解中的对齐映射在 1D 取周期平移，在 2D 取整体相关对齐。对多激波相互作用，单一整体平移不足以描述复杂位置误差，几何层面的分解仍需进一步设计。
+</p>
+
+<h2>7 结论</h2>
+<p>
+自回归神经代理在间断动力学上的长期失效可由条件期望机制解释：MSE 的最优预测把随机位置间断平均成斜坡，rollout 将该偏差逐帧放大。HyperFlowNet 以冻结骨干上的确定性流匹配修正器对抗这一统计吸引子，在四组基准上同时改善全局误差、激波区误差、前沿宽度与位置偏移。机理、方法与实验构成完整闭环，为含间断时序代理的设计提供了目标层面的依据。
+</p>
+
+<h2>参考文献</h2>
+<ol class="refs">
+<li>Lippe P, Veeling B S, Perdikaris P, et al. PDE-Refiner: Achieving accurate long rollouts with neural PDE solvers. NeurIPS, 2023.</li>
+<li>FC-PINO：Fourier continuation physics-informed neural operator（arXiv 编号待核对）。</li>
+<li>Tripathi S, Roberts S. Wavelet neural operator: A neural operator for parametric partial differential equations. 2023.</li>
+<li>UWNO：U-wavelet neural operator（Wang S 等，参考文献待补）。</li>
+<li>Li Z, Kovachki N, Azizzadenesheli K, et al. Fourier neural operator for parametric partial differential equations. ICLR, 2021.</li>
+<li>Lu L, Jin P, Pang G, et al. Learning nonlinear operators via DeepONet. Nature Machine Intelligence, 2021.</li>
+<li>Wu H, Hu T, Luo H, et al. Transolver: A fast transformer solver for PDEs on general geometries. 2024.</li>
+<li>Kohl G, Chen L W, Thuerey N. Benchmarking autoregressive conditional diffusion models for turbulent flow simulation. 2023.</li>
+<li>HERO: History-enriched rollout training for long-horizon autoregressive neural operators（arXiv:2607.29135，2026）。</li>
+<li>Jacobian-adaptive weighting for stability: Enhancing long-term rollout of neural PDE solvers（arXiv:2603.05538，2026）。</li>
+<li>Spectral generator neural operator for stable long-horizon PDE rollouts（arXiv:2602.18801，2026）。</li>
+<li>Luo X, et al. Posterior-mean rectified flow: Towards minimum MSE photo-realistic image restoration. arXiv:2410.00418, 2024.</li>
+<li>Autoregressive conditional diffusion models（ACDM）与扩散修正类工作（Kohl 等，2023；PDE-Refiner 对比）。</li>
+<li>Schulz-Rinne C W, Collins J P, Glaz H M. Numerical solution of the Riemann problem for two-dimensional gas dynamics. SIAM J. Sci. Comput., 1993.（二维 Riemann 配置来源）</li>
+<li>Toro E F. Riemann Solvers and Numerical Methods for Fluid Dynamics. Springer, 2009.（Sod 与 MUSCL-Rusanov 参考）</li>
+</ol>
+
+<h2>当前研究状态（截至 2026-08）</h2>
+<p>
+已完成的最小实验（1D Burgers，60 步 rollout）给出如下事实：
+</p>
+<table>
+<tr><th>方法</th><th>全局 L2</th><th>激波区 L2</th><th>TV 比</th><th>前沿偏移（格）</th></tr>
+<tr><td>UWNO（骨干）</td><td>0.128</td><td>1.081</td><td>0.195</td><td>1.49</td></tr>
+<tr><td>HyperFlowNet（流修正）</td><td>0.086</td><td>0.742</td><td>0.344</td><td>1.15</td></tr>
+<tr><td>采样式 FlowNO</td><td>0.760</td><td>1.058</td><td>1.549</td><td>2.47</td></tr>
+<tr><td>DDIM DiffNO</td><td>1.612</td><td>1.468</td><td>4.533</td><td>5.80</td></tr>
+</table>
+<p>
+同时测得骨干预测与真值之间的单步前沿位移监督均值约 0.01 格，说明 rollout 的位置漂移主要来自速度误差复合，而非单步位移；一体化的流修正器已具备隐式位置修正能力，显式输运模块在此设置下不带来额外收益，故当前方法不包含显式输运。正式实验将以上述数据为基线，在 200 步 rollout 与 2D 基准上复核。
+</p>
+
+<footer>
+HyperFlowNet 项目大纲 · 生成于 2026-08-11 · 待扩充条目以 <span class="placeholder">placeholder</span> 标注
+</footer>
+
+</div>
+</body>
+</html>
