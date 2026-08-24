@@ -1,9 +1,20 @@
-# Rollout diagnostics for discontinuity-focused evaluation
+# Discontinuity-focused rollout diagnostics
 # Author: Shengning Wang
 
 import numpy as np
-import jax
-import jax.numpy as jnp
+
+
+def ramp_width_1d(u: np.ndarray, low: float = 0.1, high: float = 0.9) -> float:
+    """10%-90% ramp width of a 1D field in cells. (N,) -> float."""
+    x = np.arange(u.size)
+    vmin = u.min()
+    vmax = u.max()
+    span = vmax - vmin
+    if span < 1e-8:
+        return 0.0
+    x_low = np.interp(vmin + low * span, u, x)
+    x_high = np.interp(vmin + high * span, u, x)
+    return float(x_high - x_low)
 
 
 def shock_mask_1d(truth: np.ndarray, width: int = 3, threshold: float = 0.08) -> np.ndarray:
@@ -16,6 +27,14 @@ def shock_mask_1d(truth: np.ndarray, width: int = 3, threshold: float = 0.08) ->
     return mask
 
 
+def _dilate(mask: np.ndarray, width: int) -> np.ndarray:
+    """Morphological dilation of a 2D mask."""
+    out = mask.copy()
+    for _ in range(width):
+        out = out | np.roll(out, 1, axis=0) | np.roll(out, -1, axis=0) | np.roll(out, 1, axis=1) | np.roll(out, -1, axis=1)
+    return out
+
+
 def shock_mask_2d(truth: np.ndarray, width: int = 1, ratio: float = 0.2) -> np.ndarray:
     """Mask cells near 2D gradient magnitude peaks. (H, W) -> (H, W) bool."""
     gx = np.zeros_like(truth)
@@ -24,22 +43,7 @@ def shock_mask_2d(truth: np.ndarray, width: int = 1, ratio: float = 0.2) -> np.n
     gy[:-1, :] = truth[1:, :] - truth[:-1, :]
     mag = np.sqrt(gx**2 + gy**2)
     mask = mag > ratio * mag.max()
-    if width > 0:
-        mask = _dilate(mask, width)
-    return mask
-
-
-def _dilate(mask: np.ndarray, width: int) -> np.ndarray:
-    out = mask.copy()
-    for _ in range(width):
-        out = (
-            out
-            | np.roll(out, 1, axis=0)
-            | np.roll(out, -1, axis=0)
-            | np.roll(out, 1, axis=1)
-            | np.roll(out, -1, axis=1)
-        )
-    return out
+    return _dilate(mask, width) if width > 0 else mask
 
 
 def best_shift_1d(pred: np.ndarray, truth: np.ndarray) -> int:
@@ -64,8 +68,23 @@ def tv_ratio_1d(pred: np.ndarray, truth: np.ndarray) -> float:
     return float(np.abs(np.diff(pred))[band[:-1]].sum() / max(np.abs(np.diff(truth))[band[:-1]].sum(), 1e-12))
 
 
+def tv_ratio_2d(pred: np.ndarray, truth: np.ndarray, mask: np.ndarray) -> float:
+    """Total variation ratio inside the front mask band."""
+    gx = np.zeros_like(pred)
+    gy = np.zeros_like(pred)
+    gx[:, :-1] = pred[:, 1:] - pred[:, :-1]
+    gy[:-1, :] = pred[1:, :] - pred[:-1, :]
+    p_mag = np.sqrt(gx**2 + gy**2)
+    gx = np.zeros_like(truth)
+    gy = np.zeros_like(truth)
+    gx[:, :-1] = truth[:, 1:] - truth[:, :-1]
+    gy[:-1, :] = truth[1:, :] - truth[:-1, :]
+    t_mag = np.sqrt(gx**2 + gy**2)
+    return float(p_mag[mask].sum() / max(t_mag[mask].sum(), 1e-12))
+
+
 def spectrum_error_1d(pred: np.ndarray, truth: np.ndarray) -> float:
-    """Relative L2 error of the Fourier magnitude spectrum."""
+    """Relative L2 error of the 1D Fourier magnitude spectrum."""
     p = np.abs(np.fft.rfft(pred))
     t = np.abs(np.fft.rfft(truth))
     return float(np.linalg.norm(p - t) / max(np.linalg.norm(t), 1e-12))
@@ -78,27 +97,27 @@ def spectrum_error_2d(pred: np.ndarray, truth: np.ndarray) -> float:
     return float(np.linalg.norm(p - t) / max(np.linalg.norm(t), 1e-12))
 
 
-def rollout_diagnostics(model, test: np.ndarray, steps: int, advance=None) -> dict[str, np.ndarray]:
+def _rel_l2(pred: np.ndarray, truth: np.ndarray) -> float:
+    return float(np.linalg.norm(pred - truth) / max(np.linalg.norm(truth), 1e-12))
+
+
+def _spectrum_error(pred: np.ndarray, truth: np.ndarray, ndim: int) -> float:
+    return spectrum_error_1d(pred, truth) if ndim == 1 else spectrum_error_2d(pred, truth)
+
+
+def rollout_diagnostics(step_fn, test: np.ndarray, steps: int, history: int = 1) -> dict:
     """Per-step global, shock, shape, transport, TV, offset, and spectrum errors.
 
     Args:
-        model: Transition model with __call__(x) -> x.
+        step_fn: Callable mapping a history window (1, H*C, *S) to the next frame.
         test (np.ndarray): Test trajectories (TEST, T+1, C, *S).
         steps (int): Rollout length.
-        advance: Optional jitted rollout function advance(model, c, key).
+        history (int): History window length in frames.
 
     Returns:
         dict: Per-step arrays of length steps.
     """
     ndim = test.ndim - 3
-    if advance is None:
-        jitted = eqx_filter_jit(model)
-
-    def apply(state, key):
-        if advance is None:
-            return jitted(state)
-        return advance(model, state, key)
-
     n_test = len(test)
     global_err = np.zeros(steps)
     shock_err = np.zeros(steps)
@@ -110,14 +129,14 @@ def rollout_diagnostics(model, test: np.ndarray, steps: int, advance=None) -> di
     offsets = np.zeros(steps)
     offset_count = np.zeros(steps)
     spectrum = np.zeros(steps)
-    key = jax.random.PRNGKey(0)
+
     for traj in test:
-        state = jnp.asarray(traj[0][None], dtype=jnp.float32)
+        window = traj[:history].astype(np.float32)  # (H, C, *S)
         for t in range(steps):
-            key, sk = jax.random.split(key)
-            state = apply(state, sk)
-            truth = traj[t + 1]
+            state = step_fn(window[None])
+            truth = traj[history + t]
             pred = np.asarray(state[0])
+            window = np.concatenate([window[1:], pred[None]], axis=0)
             global_err[t] += _rel_l2(pred, truth)
             spectrum[t] += _spectrum_error(pred[0], truth[0], ndim)
             if ndim == 1:
@@ -141,6 +160,7 @@ def rollout_diagnostics(model, test: np.ndarray, steps: int, advance=None) -> di
                     counts[t] += 1
                     tv_ratio[t] += tv_ratio_2d(pred[0], truth[0], mask)
                     tv_count[t] += 1
+
     counts[counts == 0] = 1
     tv_count[tv_count == 0] = 1
     offset_count[offset_count == 0] = 1
@@ -155,33 +175,9 @@ def rollout_diagnostics(model, test: np.ndarray, steps: int, advance=None) -> di
     }
 
 
-def _rel_l2(pred: np.ndarray, truth: np.ndarray) -> float:
-    return float(np.linalg.norm(pred - truth) / max(np.linalg.norm(truth), 1e-12))
-
-
-def _spectrum_error(pred: np.ndarray, truth: np.ndarray, ndim: int) -> float:
-    if ndim == 1:
-        return spectrum_error_1d(pred, truth)
-    return spectrum_error_2d(pred, truth)
-
-
-def tv_ratio_2d(pred: np.ndarray, truth: np.ndarray, mask: np.ndarray) -> float:
-    """Total variation ratio inside the front mask band."""
-    gx = np.zeros_like(pred)
-    gy = np.zeros_like(pred)
-    gx[:, :-1] = pred[:, 1:] - pred[:, :-1]
-    gy[:-1, :] = pred[1:, :] - pred[:-1, :]
-    p_mag = np.sqrt(gx**2 + gy**2)
-    gx = np.zeros_like(truth)
-    gy = np.zeros_like(truth)
-    gx[:, :-1] = truth[:, 1:] - truth[:, :-1]
-    gy[:-1, :] = truth[1:, :] - truth[:-1, :]
-    t_mag = np.sqrt(gx**2 + gy**2)
-    return float(p_mag[mask].sum() / max(t_mag[mask].sum(), 1e-12))
-
-
-def summarize(diag: dict[str, np.ndarray]) -> dict:
+def summarize(diag: dict) -> dict:
     """Convert diagnostics to a JSON-friendly metric dict."""
+    steps = len(diag["global"])
     return {
         "global": diag["global"].tolist(),
         "shock": diag["shock"].tolist(),
@@ -195,12 +191,5 @@ def summarize(diag: dict[str, np.ndarray]) -> dict:
         "spectrum_mean": float(diag["spectrum"].mean()),
         "tv_ratio": float(diag["tv_ratio"].mean()),
         "edge_offset": float(diag["edge_offset"].mean()),
-        "global_step60": float(diag["global"][min(59, len(diag["global"]) - 1)]),
+        "global_step60": float(diag["global"][min(59, steps - 1)]),
     }
-
-
-def eqx_filter_jit(model):
-    """Lazily import equinox to keep the module import light."""
-    import equinox as eqx
-
-    return eqx.filter_jit(model)

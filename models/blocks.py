@@ -1,304 +1,169 @@
-# Shared building blocks for 1D/2D neural operators
+# Shared 1D/2D building blocks for neural operators
 # Author: Shengning Wang
 
 import math
 
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-from jax import random
+import torch
+import torch.nn.functional as F
+from torch import nn
 
 
-# ============================================================
-# Convolutions and pooling
-# ============================================================
-
-
-def _conv(
-    ndim: int,
-    key: jax.Array,
-    c_in: int,
-    c_out: int,
-    k: int = 3,
-) -> eqx.Module:
-    """Create a 1D or 2D convolution with same padding."""
+def conv(ndim: int, c_in: int, c_out: int, k: int = 3, stride: int = 1) -> nn.Module:
+    """1D or 2D convolution with same padding."""
     if ndim == 1:
-        return eqx.nn.Conv1d(c_in, c_out, k, padding=k // 2, key=key)
-    return eqx.nn.Conv2d(c_in, c_out, k, padding=k // 2, key=key)
+        return nn.Conv1d(c_in, c_out, k, stride, padding=k // 2)
+    return nn.Conv2d(c_in, c_out, k, stride, padding=k // 2)
 
 
-def _cv(conv: eqx.Module, x: jnp.ndarray) -> jnp.ndarray:
-    """Apply a convolution over a batched input. (B, C, *S) -> (B, C_OUT, *S)."""
-    return jax.vmap(conv)(x)
+def group_norm(channels: int) -> nn.Module:
+    """GroupNorm with at most 8 groups, valid for 1D and 2D inputs."""
+    return nn.GroupNorm(min(8, channels), channels)
 
 
-def _pool(x: jnp.ndarray) -> jnp.ndarray:
-    """Average-pool by a factor of 2 on all spatial axes."""
+def pool2(x: torch.Tensor) -> torch.Tensor:
+    """Average pool by a factor of 2 on all spatial axes."""
     if x.ndim == 3:
         return 0.5 * (x[..., 0::2] + x[..., 1::2])
-    return 0.25 * (
-        x[..., 0::2, 0::2]
-        + x[..., 0::2, 1::2]
-        + x[..., 1::2, 0::2]
-        + x[..., 1::2, 1::2]
-    )
+    return 0.25 * (x[..., 0::2, 0::2] + x[..., 0::2, 1::2] + x[..., 1::2, 0::2] + x[..., 1::2, 1::2])
 
 
-def _up(x: jnp.ndarray) -> jnp.ndarray:
-    """Nearest-neighbor up-sample by a factor of 2 on all spatial axes."""
+def up2(x: torch.Tensor) -> torch.Tensor:
+    """Nearest-neighbor upsample by a factor of 2 on all spatial axes."""
     if x.ndim == 3:
-        return jnp.repeat(x, 2, axis=-1)
-    return jnp.repeat(jnp.repeat(x, 2, axis=-1), 2, axis=-2)
+        return torch.repeat_interleave(x, 2, dim=-1)
+    return torch.repeat_interleave(torch.repeat_interleave(x, 2, dim=-1), 2, dim=-2)
 
 
-class ConvBlock(eqx.Module):
-    """Two convolutions with GELU activations."""
-
-    conv1: eqx.Module
-    conv2: eqx.Module
-
-    def __init__(self, ndim: int, key: jax.Array, c_in: int, c_out: int, k: int = 3) -> None:
-        k1, k2 = random.split(key)
-        self.conv1 = _conv(ndim, k1, c_in, c_out, k=k)
-        self.conv2 = _conv(ndim, k2, c_out, c_out, k=k)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Apply Conv-GELU-Conv-GELU. (B, C_IN, *S) -> (B, C_OUT, *S)."""
-        h = jax.nn.gelu(_cv(self.conv1, x))
-        return jax.nn.gelu(_cv(self.conv2, h))
+def coords(x: torch.Tensor) -> torch.Tensor:
+    """Normalized coordinate grid appended as extra channels. (B, C, *S) -> (B, C+2, *S)."""
+    grid = torch.meshgrid(
+        *[torch.linspace(0.0, 1.0, s, device=x.device, dtype=x.dtype) for s in x.shape[2:]], indexing="ij"
+    )
+    extra = torch.stack([g.expand_as(x[:, :1]) for g in grid], dim=1)
+    return torch.cat([x, extra], dim=1)
 
 
-# ============================================================
-# Spectral convolution
-# ============================================================
+class ConvBlock(nn.Module):
+    """Two convolutions with GELU and group norm. (B, C, *S) -> (B, C_OUT, *S)."""
+
+    def __init__(self, ndim: int, c_in: int, c_out: int, k: int = 3) -> None:
+        super().__init__()
+        self.c1 = conv(ndim, c_in, c_out, k)
+        self.n1 = group_norm(c_out)
+        self.c2 = conv(ndim, c_out, c_out, k)
+        self.n2 = group_norm(c_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.gelu(self.n1(self.c1(x)))
+        return F.gelu(self.n2(self.c2(h)))
 
 
-class SpectralConv(eqx.Module):
-    """Spectral multiplication plus local mixing for 1D or 2D fields."""
+class SpectralConv1d(nn.Module):
+    """Fourier spectral convolution for 1D fields. (B, C, N) -> (B, C, N)."""
 
-    w_r: jax.Array
-    w_i: jax.Array
-    local: eqx.Module
-    modes: int = eqx.field(static=True)
-    ndim: int = eqx.field(static=True)
-
-    def __init__(self, ndim: int, key: jax.Array, width: int, modes: int) -> None:
-        k1, k2, k3 = random.split(key, 3)
-        if ndim == 1:
-            shape = (width, width, modes)
-        else:
-            shape = (width, width, modes, modes)
-        self.w_r = 0.1 * random.normal(k1, shape)
-        self.w_i = 0.1 * random.normal(k2, shape)
-        self.local = _conv(ndim, k3, width, width)
+    def __init__(self, c_in: int, c_out: int, modes: int) -> None:
+        super().__init__()
         self.modes = modes
-        self.ndim = ndim
+        scale = 1.0 / (c_in * c_out)
+        self.weight = nn.Parameter(scale * torch.rand(c_in, c_out, modes, 2))
 
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Apply spectral and local mixing. (B, C, *S) -> (B, C, *S)."""
-        w = self.w_r + 1j * self.w_i
-        if self.ndim == 1:
-            x_hat = jnp.fft.rfft(x, axis=-1)[..., : self.modes]
-            m = x_hat.shape[-1]
-            y_hat = jnp.einsum("bck,ock->bok", x_hat, w[..., :m])
-            y = jnp.fft.irfft(y_hat, n=x.shape[-1], axis=-1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, N = x.shape
+        x_ft = torch.fft.rfft(x)
+        out_ft = torch.zeros(B, self.weight.shape[1], N // 2 + 1, device=x.device, dtype=torch.complex64)
+        w = torch.view_as_complex(self.weight)
+        out_ft[:, :, : self.modes] = torch.einsum("bcn,com->bom", x_ft[:, :, : self.modes], w)
+        return torch.fft.irfft(out_ft, n=N)
+
+
+class SpectralConv2d(nn.Module):
+    """Fourier spectral convolution for 2D fields. (B, C, H, W) -> (B, C, H, W)."""
+
+    def __init__(self, c_in: int, c_out: int, modes: int) -> None:
+        super().__init__()
+        self.modes = modes
+        scale = 1.0 / (c_in * c_out)
+        self.weight = nn.Parameter(scale * torch.rand(c_in, c_out, modes, modes, 2))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        x_ft = torch.fft.rfft2(x)
+        out_ft = torch.zeros(B, self.weight.shape[1], H, W // 2 + 1, device=x.device, dtype=torch.complex64)
+        w = torch.view_as_complex(self.weight)
+        out_ft[:, :, : self.modes, : self.modes] = torch.einsum("bcnm,comn->bomn", x_ft[:, :, : self.modes, : self.modes], w)
+        return torch.fft.irfft2(out_ft, s=(H, W))
+
+
+class PatchEmbed(nn.Module):
+    """Patch embedding by strided convolution without padding. (B, C, *S) -> (B, D, *S')."""
+
+    def __init__(self, ndim: int, c_in: int, dim: int, patch: int) -> None:
+        super().__init__()
+        if ndim == 1:
+            self.proj = nn.Conv1d(c_in, dim, patch, stride=patch)
         else:
-            x_hat = jnp.fft.rfft2(x, axes=(-2, -1))[..., : self.modes, : self.modes]
-            mh, mw = x_hat.shape[-2:]
-            y_hat = jnp.einsum("bchw,ochw->bohw", x_hat, w[..., :mh, :mw])
-            y = jnp.fft.irfft2(y_hat, s=x.shape[-2:], axes=(-2, -1))
-        return jax.nn.gelu(y + _cv(self.local, x))
+            self.proj = nn.Conv2d(c_in, dim, patch, stride=patch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
 
 
-# ============================================================
-# Haar wavelets
-# ============================================================
+class TransformerBlock(nn.Module):
+    """Pre-LN transformer block with self-attention. (B, N, D) -> (B, N, D)."""
+
+    def __init__(self, dim: int, heads: int, mlp_ratio: float = 2.0) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, int(dim * mlp_ratio)), nn.GELU(), nn.Linear(int(dim * mlp_ratio), dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        h, _ = self.attn(h, h, h)
+        x = x + h
+        return x + self.mlp(self.norm2(x))
 
 
-def haar_split_1d(x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """1D Haar split into average and detail. (B, C, N) -> (B, C, N/2) each."""
+def haar_1d(x: torch.Tensor) -> torch.Tensor:
+    """1D Haar decomposition: (B, C, N) -> (B, C, N) with low half then high half."""
     even, odd = x[..., 0::2], x[..., 1::2]
-    return (even + odd) / math.sqrt(2.0), (even - odd) / math.sqrt(2.0)
+    lo = (even + odd) / math.sqrt(2.0)
+    hi = (even - odd) / math.sqrt(2.0)
+    return torch.cat([lo, hi], dim=-1)
 
 
-def haar_merge_1d(a: jnp.ndarray, d: jnp.ndarray) -> jnp.ndarray:
-    """Inverse 1D Haar merge. (B, C, N/2) each -> (B, C, N)."""
-    even = (a + d) / math.sqrt(2.0)
-    odd = (a - d) / math.sqrt(2.0)
-    return jnp.stack([even, odd], axis=-1).reshape(*even.shape[:-1], 2 * even.shape[-1])
+def ihaar_1d(y: torch.Tensor) -> torch.Tensor:
+    """1D Haar reconstruction of haar_1d output. (B, C, N) -> (B, C, N)."""
+    n = y.shape[-1] // 2
+    lo, hi = y[..., :n], y[..., n:]
+    even = (lo + hi) / math.sqrt(2.0)
+    odd = (lo - hi) / math.sqrt(2.0)
+    out = torch.empty_like(y)
+    out[..., 0::2] = even
+    out[..., 1::2] = odd
+    return out
 
 
-def _merge_axis(x: jnp.ndarray, y: jnp.ndarray, axis: int) -> jnp.ndarray:
-    """Interleave two half-resolution arrays along one spatial axis."""
-    axis = axis % x.ndim
-    even = (x + y) / math.sqrt(2.0)
-    odd = (x - y) / math.sqrt(2.0)
-    return jnp.stack([even, odd], axis=axis + 1).reshape(
-        *x.shape[:axis], 2 * x.shape[axis], *x.shape[axis + 1 :]
+def haar_2d(x: torch.Tensor) -> torch.Tensor:
+    """2D Haar decomposition: (B, C, H, W) -> (B, 4C, H/2, W/2)."""
+    h = haar_1d(x)
+    h = haar_1d(h.transpose(-1, -2)).transpose(-1, -2)
+    B, C, H, W = h.shape
+    hh = H // 2
+    ww = W // 2
+    return torch.cat(
+        [h[:, :, :hh, :ww], h[:, :, :hh, ww:], h[:, :, hh:, :ww], h[:, :, hh:, ww:]], dim=1
     )
 
 
-def haar_split_2d(x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """2D Haar split along W then H. (B, C, H, W) -> (B, C, H/2, W/2) each."""
-    even_w, odd_w = x[..., 0::2], x[..., 1::2]
-    a0 = (even_w + odd_w) / math.sqrt(2.0)
-    d0 = (even_w - odd_w) / math.sqrt(2.0)
-    a0e, a0o = a0[..., 0::2, :], a0[..., 1::2, :]
-    a = (a0e + a0o) / math.sqrt(2.0)
-    dy = (a0e - a0o) / math.sqrt(2.0)
-    d0e, d0o = d0[..., 0::2, :], d0[..., 1::2, :]
-    dx = (d0e + d0o) / math.sqrt(2.0)
-    dxy = (d0e - d0o) / math.sqrt(2.0)
-    return a, dx, dy, dxy
-
-
-def haar_merge_2d(a: jnp.ndarray, dx: jnp.ndarray, dy: jnp.ndarray, dxy: jnp.ndarray) -> jnp.ndarray:
-    """Inverse 2D Haar merge. (B, C, H/2, W/2) each -> (B, C, H, W)."""
-    a0 = _merge_axis(a, dy, axis=-2)
-    d0 = _merge_axis(dx, dxy, axis=-2)
-    return _merge_axis(a0, d0, axis=-1)
-
-
-def dwt_1d(x: jnp.ndarray, levels: int) -> list[jnp.ndarray]:
-    """1D Haar decomposition, coarse average first. (B, C, N) -> [a, d_L, ..., d_1]."""
-    a = x
-    details = []
-    for _ in range(levels):
-        a, d = haar_split_1d(a)
-        details.append(d)
-    return [a, *details[::-1]]
-
-
-def idwt_1d(coeffs: list[jnp.ndarray]) -> jnp.ndarray:
-    """Inverse 1D Haar transform."""
-    out = coeffs[0]
-    for d in coeffs[1:]:
-        out = haar_merge_1d(out, d)
-    return out
-
-
-def dwt_2d(x: jnp.ndarray, levels: int) -> list:
-    """2D Haar decomposition, coarse average first."""
-    a = x
-    bands = []
-    for _ in range(levels):
-        a, dx, dy, dxy = haar_split_2d(a)
-        bands.append((dx, dy, dxy))
-    return [a, *bands[::-1]]
-
-
-def idwt_2d(coeffs: list) -> jnp.ndarray:
-    """Inverse 2D Haar transform."""
-    out = coeffs[0]
-    for dx, dy, dxy in coeffs[1:]:
-        out = haar_merge_2d(out, dx, dy, dxy)
-    return out
-
-
-# ============================================================
-# Transformer blocks
-# ============================================================
-
-
-class PatchEmbed(eqx.Module):
-    """Patch embedding for 1D or 2D fields."""
-
-    proj: eqx.nn.Linear
-    patch_size: int = eqx.field(static=True)
-    ndim: int = eqx.field(static=True)
-
-    def __init__(self, ndim: int, key: jax.Array, c_in: int, dim: int, patch_size: int) -> None:
-        patch_elems = patch_size if ndim == 1 else patch_size * patch_size
-        self.proj = eqx.nn.Linear(c_in * patch_elems, dim, key=key)
-        self.patch_size = patch_size
-        self.ndim = ndim
-
-    def __call__(self, x: jnp.ndarray) -> tuple[jnp.ndarray, tuple[int, ...]]:
-        """Embed patches into tokens. (B, C, *S) -> (B, T, D), grid."""
-        if self.ndim == 1:
-            b, c, n = x.shape
-            p = self.patch_size
-            t = n // p
-            patches = x.reshape(b, c, t, p).transpose(0, 2, 1, 3).reshape(b * t, c * p)
-            tokens = jax.vmap(self.proj)(patches).reshape(b, t, -1)
-            return tokens, (t,)
-        b, c, h, w = x.shape
-        p = self.patch_size
-        th, tw = h // p, w // p
-        patches = (
-            x.reshape(b, c, th, p, tw, p)
-            .transpose(0, 2, 4, 1, 3, 5)
-            .reshape(b, th * tw, c * p * p)
-        )
-        tokens = jax.vmap(self.proj)(patches.reshape(b * th * tw, -1)).reshape(b, th * tw, -1)
-        return tokens, (th, tw)
-
-
-class MultiHeadAttention(eqx.Module):
-    """Scaled dot-product self-attention over token sequences."""
-
-    w_q: eqx.nn.Linear
-    w_k: eqx.nn.Linear
-    w_v: eqx.nn.Linear
-    w_o: eqx.nn.Linear
-    heads: int = eqx.field(static=True)
-
-    def __init__(self, key: jax.Array, dim: int, heads: int) -> None:
-        k1, k2, k3, k4 = random.split(key, 4)
-        self.w_q = eqx.nn.Linear(dim, dim, key=k1)
-        self.w_k = eqx.nn.Linear(dim, dim, key=k2)
-        self.w_v = eqx.nn.Linear(dim, dim, key=k3)
-        self.w_o = eqx.nn.Linear(dim, dim, key=k4)
-        self.heads = heads
-
-    def __call__(self, tokens: jnp.ndarray) -> jnp.ndarray:
-        """Apply attention. (B, T, D) -> (B, T, D)."""
-        b, t, d = tokens.shape
-        h = self.heads
-        dh = d // h
-        flat = tokens.reshape(b * t, d)
-        q = jax.vmap(self.w_q)(flat).reshape(b, t, h, dh)
-        k = jax.vmap(self.w_k)(flat).reshape(b, t, h, dh)
-        v = jax.vmap(self.w_v)(flat).reshape(b, t, h, dh)
-        attn = jax.nn.softmax(jnp.einsum("bthd,bshd->bhts", q, k) / math.sqrt(dh), axis=-1)
-        out = jnp.einsum("bhts,bshd->bthd", attn, v).reshape(b, t, d)
-        return jax.vmap(self.w_o)(out.reshape(b * t, d)).reshape(b, t, d)
-
-
-class TransformerBlock(eqx.Module):
-    """Pre-norm transformer block with residual attention and FFN."""
-
-    norm1: eqx.nn.LayerNorm
-    attn: MultiHeadAttention
-    norm2: eqx.nn.LayerNorm
-    ffn: list[eqx.nn.Linear]
-
-    def __init__(self, key: jax.Array, dim: int, heads: int, ffn_dim: int) -> None:
-        k1, k2, k3 = random.split(key, 3)
-        self.norm1 = eqx.nn.LayerNorm((dim,))
-        self.attn = MultiHeadAttention(k1, dim, heads)
-        self.norm2 = eqx.nn.LayerNorm((dim,))
-        self.ffn = [
-            eqx.nn.Linear(dim, ffn_dim, key=k2),
-            eqx.nn.Linear(ffn_dim, dim, key=k3),
-        ]
-
-    def __call__(self, tokens: jnp.ndarray) -> jnp.ndarray:
-        """Apply one transformer block. (B, T, D) -> (B, T, D)."""
-        b, t, d = tokens.shape
-        normed = jax.vmap(self.norm1)(tokens.reshape(b * t, d)).reshape(b, t, d)
-        tokens = tokens + self.attn(normed)
-        normed = jax.vmap(self.norm2)(tokens.reshape(b * t, d)).reshape(b, t, d)
-        h = jax.nn.gelu(jax.vmap(self.ffn[0])(normed.reshape(b * t, d)))
-        h = jax.vmap(self.ffn[1])(h).reshape(b, t, d)
-        return tokens + h
-
-
-def coords_grid(ndim: int, shape: tuple[int, ...]) -> jnp.ndarray:
-    """Normalized grid coordinates. (N, D) for 1D or (H*W, 2) for 2D."""
-    if ndim == 1:
-        n = shape[0]
-        return jnp.linspace(0.0, 1.0, n)[:, None]
-    h, w = shape
-    xs, ys = jnp.meshgrid(jnp.linspace(0.0, 1.0, w), jnp.linspace(0.0, 1.0, h))
-    return jnp.stack([ys.ravel(), xs.ravel()], axis=-1)
+def ihaar_2d(y: torch.Tensor) -> torch.Tensor:
+    """2D Haar reconstruction of haar_2d output. (B, 4C, H, W) -> (B, C, 2H, 2W)."""
+    B, C4, H, W = y.shape
+    C = C4 // 4
+    ll, lh, hl, hh = y[:, :C], y[:, C : 2 * C], y[:, 2 * C : 3 * C], y[:, 3 * C :]
+    w_lo = torch.cat([ll, hl], dim=-2)
+    w_hi = torch.cat([lh, hh], dim=-2)
+    h = torch.cat([w_lo, w_hi], dim=-1)
+    h = ihaar_1d(h.transpose(-1, -2)).transpose(-1, -2)
+    return ihaar_1d(h)

@@ -4,86 +4,81 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-**HyperFlowNet** is the JAX/Equinox transient surrogate repository in the WSNet family. It keeps the autoregressive rollout and mechanism-analysis workflow local to this repository while reusing the lightweight configuration, logging, seeding, and utility style of [WSNet](https://github.com/SN-WANG/WSNet).
+**HyperFlowNet** is a PyTorch research repository for spatiotemporal prediction of discontinuous physical fields (shocks, interfaces, fronts). It studies why autoregressive neural operators smear discontinuities and proposes a path-level flow-matching fix, following the mechanism-analysis layout of [WSNet](https://github.com/SN-WANG/WSNet).
 
-## 📌 Overview
+## Overview
 
-HyperFlowNet keeps the full workflow for this task in one place: dataset generation, model training, mechanism experiments, rollout evaluation, metric export, and paper drafting.
+The repository keeps the full workflow in one place: mechanism data generation, model training, mechanism experiments, rollout evaluation, and metric export.
 
-The current scope includes:
+Current scope:
 
-- pseudospectral 1D/2D Burgers data generation
-- MUSCL-Rusanov 1D Sod and 2D Euler Riemann data generation
-- autoregressive rollout learning with a UWNO backbone
-- deterministic flow-matching residual correction on a frozen backbone
-- conditional-expectation smearing analysis for discontinuous dynamics
-- transport/shape error decomposition across neural operator baselines
-- five training objectives: MSE, HyperFlowNet, FlowNO, DiffNO, and front-loss
+- synthetic step-family data for the conditional-expectation smearing mechanism
+- 1D Burgers, 1D Sod, and 2D Euler Riemann data generators
+- Neptuna (2D-SABW / 2D-SDBA) engineering data loader
+- nine baselines: FNO, DeepONet, U-Net, ViT, WNO, UWNO, CFM, OT-CFM, PDE-Refiner
+- HyperFlowNet: single-stage, path-level flow-matching surrogate with front transport
+- conditional-expectation, scaling-law, and flow-matching mechanism experiments
+- layered discontinuity metrics (front width, edge offset, TV ratio, shape/transport decomposition)
 
-## ✨ Highlights
+## Highlights
 
-- `HyperFlowNet` as a deterministic flow-corrected autoregressive surrogate
+- PyTorch only, single-GPU friendly (RTX 5090), AMP bf16 support
 - YAML-driven experiments through `config.yaml`
-- Two-stage training with a cached backbone shared by all corrector variants
-- Straight-path flow matching on the residual between backbone prediction and truth
-- Deterministic Euler integration at inference to avoid sampling-noise accumulation
-- 1D/2D baselines: CNN, U-Net, ViT, DeepONet, FNO, WNO, UWNO, PDE-Refiner
-- Synthetic conditional-expectation experiments with analytic scaling laws
-- Per-step global, shock, TV, offset, transport/shape, and spectrum metrics
-- `.npz` dataset persistence with per-channel normalization
+- path-family ablations: straight-path CFM, OT-coupled CFM, transport-path HyperFlowNet
+- deterministic probability-flow ODE inference (no sampling noise accumulation)
+- mechanism experiments with analytic scaling laws (2.56σ ramp width)
+- per-step global, shock, TV, offset, transport/shape, and spectrum metrics
 
-## 🧱 Repository Layout
+## Repository Layout
 
 ```text
 HyperFlowNet/
-├── main.py                  # Unified entry point: generate / train / evaluate / mechanism
+├── main.py                  # Entry point: generate / train / evaluate / mechanism / benchmark
 ├── config.yaml              # Experiment configuration
-├── trainer.py               # Training loop with five objectives
+├── trainer.py               # Training objectives, Sinkhorn coupling, evaluation
 ├── models/
-│   ├── __init__.py
-│   ├── blocks.py
-│   ├── operators.py
-│   ├── corrector.py
-│   └── hyperflownet.py
+│   ├── __init__.py          # Model registry
+│   ├── blocks.py            # Shared 1D/2D building blocks
+│   ├── operators.py         # FNO, DeepONet, U-Net, ViT, WNO, UWNO
+│   ├── velocity.py          # FlowUNet / FlowNO conditional velocity networks
+│   ├── pde_refiner.py       # PDE-Refiner baseline
+│   └── hyperflownet.py      # HyperFlowNet (five components)
 ├── data/
 │   ├── __init__.py
-│   ├── burgers.py
-│   ├── euler.py
-│   └── datasets.py
+│   ├── synthetic.py         # Mechanism synthetic data
+│   ├── burgers.py           # 1D Burgers generator
+│   ├── euler.py             # 1D Sod and 2D Euler Riemann generators
+│   ├── neptuna.py           # Neptuna loader (bubble / droplet)
+│   └── datasets.py          # Registry, normalization, persistence
 ├── utils/
 │   ├── __init__.py
-│   ├── hue_logger.py
-│   ├── seeder.py
-│   ├── metrics.py
-│   ├── mechanism.py
-│   ├── plotting.py
-│   └── sweeper.py
+│   ├── hue_logger.py        # from WSNet
+│   ├── scaler.py            # from WSNet
+│   ├── seeder.py            # from WSNet
+│   ├── sweeper.py           # from WSNet
+│   ├── metrics.py           # Discontinuity-focused rollout diagnostics
+│   ├── mechanism.py         # Mechanism experiments
+│   └── plotting.py          # Mechanism and rollout figures
+├── AGENTS.md                # Project notes for AI agents
 ├── README.md
-├── LICENSE
+└── LICENSE
 ```
 
-## 🚀 Running Experiments
+## Running Experiments
 
-### Clone the repository
+### Install dependencies
 
 ```bash
-git clone https://github.com/SN-WANG/HyperFlowNet.git
-cd HyperFlowNet
+pip install -r requirements.txt
 ```
 
-### Install the dependencies you need
-
-```bash
-pip install jax equinox optax pyyaml numpy scipy matplotlib
-```
-
-### Generate data
+### Generate mechanism datasets
 
 ```bash
 python main.py generate --config config.yaml
 ```
 
-Generated datasets are saved under `data/raw/` as `.npz` files.
+Generated datasets are saved under `data/` as `.npz` files.
 
 ### Train a baseline
 
@@ -100,43 +95,47 @@ python main.py train --config config.yaml --model HyperFlowNet --objective hyflo
 ### Evaluate a checkpoint
 
 ```bash
-python main.py evaluate --config config.yaml --checkpoint runs/exp/ckpt.eqx
+python main.py evaluate --config config.yaml --checkpoint runs/exp/ckpt.pt
 ```
 
-### Run the mechanism experiments
+### Run mechanism experiments
 
 ```bash
 python main.py mechanism --config config.yaml
 ```
 
-## 📂 Expected Data Format
+### Run a benchmark sweep
 
-The default workflow generates trajectories and stores them in a compressed NumPy archive:
+```bash
+python main.py benchmark --config config.yaml
+```
+
+## Expected Data Format
+
+Mechanism datasets are generated locally and stored under `data/`:
 
 ```text
-data/raw/
+data/
 ├── burgers_1d_256.npz
-├── burgers_2d_128.npz
 ├── sod_1d_512.npz
 └── euler_2d_riemann_128.npz
 ```
 
 Each archive contains:
 
-- `train`: tensor of shape `(TRAIN, T+1, C, *S)` (normalized)
-- `test`: tensor of shape `(TEST, T+1, C, *S)` (normalized)
+- `train`, `test`: normalized trajectories of shape `(N, T+1, C, *S)`
 - `x`, `y`: grid coordinates
 - `mean`, `std`: per-channel normalization statistics
-- `meta_json`: dataset metadata, including grid, steps, channels, and config
+- `meta_json`: dataset metadata
 
-`C` is 1 for Burgers, 3 for Sod, and 4 for 2D Euler. `S` is `N` for 1D and `H, W` for 2D.
+Engineering data (Neptuna) is loaded from the absolute paths in `config.yaml` (`data.neptuna.bubble.path`, `data.neptuna.droplet.path`); the loader reads `train.h5` / `test.h5` directly from those directories.
 
-## 🧾 Workflow Outputs
+## Workflow Outputs
 
 ```text
 runs/
 ├── <experiment>/
-│   ├── ckpt.eqx
+│   ├── ckpt.pt
 │   ├── history.json
 │   ├── metrics.json
 │   └── rollout.png
@@ -145,13 +144,11 @@ runs/
     └── synthetic_ce.png
 ```
 
-Checkpoints serialize the full Equinox model. The backbone is cached separately so that all corrector variants and objective ablations share the same pretrained backbone.
+## Relationship to WSNet
 
-## 🔗 Relationship to WSNet
+HyperFlowNet follows the repository organization and utility style of [WSNet](https://github.com/SN-WANG/WSNet). The `utils/` package (logging, scaling, seeding, sweeping) is shared with WSNet; the PDE data pipeline, model zoo, and mechanism-analysis workflow live in this repository.
 
-HyperFlowNet follows the repository organization and utility style of [WSNet](https://github.com/SN-WANG/WSNet). WSNet keeps reusable core modules, while HyperFlowNet keeps the PDE dataset pipeline, the JAX/Equinox model zoo, and the mechanism-analysis workflow in one place.
-
-## 📚 Citation
+## Citation
 
 If this repository is useful in your work, please cite it as a software project.
 
@@ -164,6 +161,6 @@ If this repository is useful in your work, please cite it as a software project.
 }
 ```
 
-## 📄 License
+## License
 
 This project is released under the MIT License. See [LICENSE](LICENSE) for details.

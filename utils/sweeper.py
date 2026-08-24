@@ -16,7 +16,7 @@ DEFAULT_IGNORE_DIRS = {
     "dist", "build", "*.egg-info",
 }
 DEFAULT_IGNORE_PATTERNS = {"*.pyc", "*.pyo", ".DS_Store", "*.log"}
-APP_TITLE = "HYFLOW Project Utilities"
+APP_TITLE = "WSNET Project Utilities"
 BANNER_WIDTH = 60
 
 

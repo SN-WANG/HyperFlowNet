@@ -70,6 +70,41 @@ def plot_mechanism(result: dict, out_path: str | Path) -> None:
     plt.close(fig)
 
 
+def plot_fm_width(result: dict, out_path: str | Path) -> None:
+    """Save the ODE endpoint width vs sigma per path family."""
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    first = next(iter(result.values()))
+    sigmas = first["sigmas"]
+    ax.plot(sigmas, [2.0 * s * 1.2816 for s in sigmas], "k--", label="analytic 2.56 sigma")
+    for path, entry in result.items():
+        ax.plot(entry["sigmas"], entry["widths"], "o-", label=path)
+    ax.set_xlabel("target displacement sigma (cells)")
+    ax.set_ylabel("endpoint 10%-90% width (cells)")
+    ax.set_title("Flow-matching endpoint width by path family")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_cross_arch(result: dict, out_path: str | Path) -> None:
+    """Save the fitted ramp width across architectures."""
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    names = list(result["widths"])
+    widths = [result["widths"][n] for n in names]
+    idx = np.arange(len(names))
+    ax.bar(idx, widths, 0.55)
+    ax.axhline(result["analytic_width"], color="k", ls="--", label=f"analytic 2.56 sigma = {result['analytic_width']:.2f}")
+    ax.set_xticks(idx)
+    ax.set_xticklabels(names, rotation=15)
+    ax.set_ylabel("fitted ramp width (cells)")
+    ax.set_title(f"Cross-architecture smearing at sigma = {result['sigma']}")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def plot_decomposition(rq1: dict, out_path: str | Path) -> None:
     """Save transport and shape error growth curves for two models."""
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))

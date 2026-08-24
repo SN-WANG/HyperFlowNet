@@ -1,4 +1,4 @@
-# 1D Sod and 2D Riemann problem data generators (MUSCL-Rusanov)
+# 1D Sod and 2D Euler Riemann data generators (MUSCL-Rusanov)
 # Author: Shengning Wang
 
 import numpy as np

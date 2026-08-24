@@ -1,43 +1,46 @@
 # Model registry for HyperFlowNet baselines and method
 # Author: Shengning Wang
 
-import equinox as eqx
-import jax
+from torch import nn
 
-from models.corrector import DiffNO, FlowNO, FlowUNet
 from models.hyperflownet import HyperFlowNet
-from models.operators import CNN, DeepONet, FNO, PDERefiner, UNet, UWNO, ViT, WNO
+from models.operators import DeepONet, FNO, UNet, ViT, WNO, UWNO
+from models.pde_refiner import PDERefiner
+from models.velocity import ConditionalFlowModel
+
+_OPERATORS = {
+    "FNO": FNO,
+    "DeepONet": DeepONet,
+    "U-Net": UNet,
+    "UNet": UNet,
+    "ViT": ViT,
+    "WNO": WNO,
+    "UWNO": UWNO,
+}
 
 
-def make_model(
-    name: str,
-    key: jax.Array,
-    c_in: int = 1,
-    ndim: int = 1,
-    cfg: dict | None = None,
-) -> eqx.Module:
-    """Create one comparison model by name."""
-    mcfg = cfg.get("model", cfg) if cfg else {}
-    if name == "CNN":
-        return CNN(key, c_in, ndim, mcfg)
-    if name == "UNet":
-        return UNet(key, c_in, ndim, mcfg)
-    if name == "ViT":
-        return ViT(key, c_in, ndim, mcfg)
-    if name == "DeepONet":
-        return DeepONet(key, c_in, ndim, mcfg)
-    if name == "FNO":
-        return FNO(key, c_in, ndim, mcfg)
-    if name == "WNO":
-        return WNO(key, c_in, ndim, mcfg)
-    if name == "UWNO":
-        return UWNO(key, c_in, ndim, mcfg)
-    if name == "PDE-Refiner":
-        return PDERefiner(key, c_in, ndim, mcfg)
-    if name == "FlowNO":
-        return FlowNO(key, c_in, ndim, mcfg)
-    if name == "DiffNO":
-        return DiffNO(key, c_in, ndim, mcfg)
+def make_model(name: str, c_in: int, ndim: int, cfg: dict | None = None, history: int = 1) -> nn.Module:
+    """Create one comparison model by name.
+
+    Args:
+        name (str): Model name in {FNO, DeepONet, U-Net, ViT, WNO, UWNO,
+            PDE-Refiner, CFM, OT-CFM, HyperFlowNet}.
+        c_in (int): Field channels.
+        ndim (int): Spatial dimension (1 or 2).
+        cfg (dict | None): Model config.
+        history (int): History window length; operators receive history * c_in
+            input channels, flow-matching models receive c_in and a context.
+
+    Returns:
+        nn.Module: The model.
+    """
+    mcfg = (cfg or {}).get("model", cfg or {})
+    if name in ("CFM", "OT-CFM"):
+        return ConditionalFlowModel(c_in, ndim, mcfg, history)
     if name == "HyperFlowNet":
-        return HyperFlowNet(key, c_in, ndim, mcfg)
-    raise ValueError(f"unknown model: {name}")
+        return HyperFlowNet(c_in, ndim, mcfg, history)
+    if name == "PDE-Refiner":
+        return PDERefiner(c_in * history, ndim, mcfg, c_out=c_in)
+    if name not in _OPERATORS:
+        raise ValueError(f"unknown model: {name}")
+    return _OPERATORS[name](c_in * history, ndim, mcfg, c_out=c_in)

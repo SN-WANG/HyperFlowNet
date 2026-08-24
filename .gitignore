@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+runs/
+data/*.npz
+smoke*.yaml
+.DS_Store

@@ -2,8 +2,8 @@
 # Author: Shengning Wang
 
 data:
-  dataset: burgers_1d
-  data_dir: data/raw
+  dataset: burgers_1d          # burgers_1d | sod_1d | euler_2d_riemann | neptuna_bubble | neptuna_droplet
+  data_dir: data               # relative to project root (mechanism datasets)
   n_train: 96
   n_test: 16
   grid: 256
@@ -11,43 +11,71 @@ data:
   nu: 0.02
   dt: 0.005
   channels: 1
+  history: 1
   seed: 0
+  neptuna:
+    bubble:
+      path: D:/data/Neptuna/multi_bubble
+      channels: [density]
+      history: 10
+      stride: 1
+      param_names: null
+    droplet:
+      path: D:/data/Neptuna/multi_droplet
+      channels: [density]
+      history: 10
+      stride: 1
+      param_names: null
 
 model:
   name: HyperFlowNet
-  backbone: UWNO
-  corrector: fno
-  modes: 16
-  width: 64
+  width: 32
   depth: 4
-  flow_steps: 8
-  patch_size: 16
+  modes: 16
+  patch_size: 8
   heads: 4
   dim: 64
-  refine_steps: 2
+  basis: 32
+  flow_steps: 8
+  mask_beta: 10.0
+  mask_kappa: 0.5
+  refine_steps: 4
 
 training:
-  steps_stage1: 250
-  steps_stage2: 250
-  batch: 256
+  objective: hyflow            # mse | frontloss | cfm | otcfm | pde_refiner | hyflow
+  steps_stage1: 500
+  steps_stage2: 500
+  batch: 64
   lr: 1e-3
-  bptt: 2
-  objective: hyflow
   seed: 0
+  device: auto                 # auto | cuda | cpu
+  amp: false
   checkpoint_dir: runs/exp
 
 eval:
-  rollout: 200
-  metrics:
-    - global_l2
-    - shock_l2
-    - tv_ratio
-    - front_offset
-    - shape_error
-    - transport_error
-    - spectrum_error
+  rollout: 100
+  n_traj: 16                   # test trajectories used for Neptuna evaluation
 
 mechanism:
   sigmas: [0.25, 0.5, 1.0, 2.0, 4.0]
-  n_samples: 8192
   n_grid: 256
+  steps: 200
+  batch: 256
+  jump: 1.0
+  sigma: 1.0
+  jumps: [0.5, 1.0, 2.0]
+  archs: [FNO, WNO, U-Net, ViT]
+  fm_paths: [straight, ot, transport]
+
+benchmark:
+  baselines:
+    - {model: FNO, objective: mse}
+    - {model: DeepONet, objective: mse}
+    - {model: U-Net, objective: mse}
+    - {model: ViT, objective: mse}
+    - {model: WNO, objective: mse}
+    - {model: UWNO, objective: mse}
+    - {model: CFM, objective: cfm}
+    - {model: OT-CFM, objective: otcfm}
+    - {model: PDE-Refiner, objective: pde_refiner}
+    - {model: HyperFlowNet, objective: hyflow}

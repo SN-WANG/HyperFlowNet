@@ -1,26 +1,35 @@
-# Reproducibility utilities for JAX experiments
+# Reproducibility utilities for machine learning experiments
 # Author: Shengning Wang
 
 import random
-
-import jax
 import numpy as np
+
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+    torch = None
 
 from utils.hue_logger import hue, logger
 
 
-def seed_everything(seed: int = 42) -> jax.Array:
+def seed_everything(seed: int = 42) -> None:
     """
-    Seed all global RNGs and return a JAX key.
+    Sets the seed for generating random numbers to ensure reproducibility.
 
     Args:
         seed (int): The seed value.
-
-    Returns:
-        jax.Array: JAX PRNG key derived from the seed.
     """
     random.seed(seed)
     np.random.seed(seed)
-    key = jax.random.PRNGKey(seed)
+
+    if _HAS_TORCH:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     logger.info(f"global seed set to {hue.m}{seed}{hue.q}")
-    return key
